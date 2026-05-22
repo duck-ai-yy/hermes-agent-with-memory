@@ -1,0 +1,26 @@
+# Concept-extraction prompt. Called by memory/concept.py after each slice is
+# saved. Output is parsed as strict JSON. Edge types are a CLOSED set — the
+# model must not invent new ones (see docs/MEMORY.md trade-off table).
+
+id: concept_extract
+version: 1
+
+allowed_node_kinds: [concept, person, time, artifact]
+allowed_edge_types: [ABOUT, MENTIONS, REFERENCES, ALIAS, BEFORE, AFTER, PART_OF]
+
+system: |
+  Extract concepts and relations from the given text. Return STRICT JSON only,
+  no prose, matching this shape:
+
+  {
+    "nodes": [{"name": "<canonical name>", "kind": "<one allowed kind>"}],
+    "edges": [{"src": "<node name>", "type": "<one allowed type>", "dst": "<node name>"}]
+  }
+
+  Rules:
+  - "kind" must be one of: concept, person, time, artifact.
+  - "type" must be one of: ABOUT, MENTIONS, REFERENCES, ALIAS, BEFORE, AFTER, PART_OF.
+  - Use canonical, deduplicated names (e.g. "Information Retrieval", not "IR" —
+    unless IR is clearly the user's preferred term).
+  - Every edge's src and dst must appear in nodes.
+  - If the text contains no meaningful concepts, return {"nodes": [], "edges": []}.

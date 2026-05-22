@@ -1,0 +1,14 @@
+# Formatting template for the retrieved-context block. retrieve.py renders each
+# selected slice through `slice_line`, then the agent appends the user message.
+# This is pure formatting — no model call uses this file directly.
+
+id: recall
+version: 1
+
+# Rendered once per retrieved slice. Placeholders: {id} {role} {created} {text}
+slice_line: |
+  [^{id}] ({role}, {created}) {text}
+
+# Shown instead of the slice list when retrieval returns nothing.
+empty: |
+  (no relevant memory found)

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mneme"
+version = "0.0.1"
+description = "Local-first chat agent with long-term, traceable memory"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+# Dependency whitelist — see PRINCIPLES.md principle 3 (native first).
+# Adding anything here requires justifying why stdlib is not enough.
+dependencies = [
+    "sqlite-vec>=0.1.0",   # native SQLite vector extension
+    "fastapi>=0.110",      # HTTP API layer
+    "uvicorn>=0.29",       # ASGI server
+    "httpx>=0.27",         # LLM calls
+    "pyyaml>=6.0",         # external prompt loading
+    "typer>=0.12",         # CLI
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+mneme = "mneme.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mneme"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
