@@ -1,9 +1,11 @@
 """Write path: turn a message into a slice + vector + concept graph.
 
-Two-stage transaction (see docs/MEMORY.md):
+Two-stage transaction (docs/MEMORY.md):
   A) slices + vec_slices  — always succeeds.
-  B) nodes + edges        — best-effort; failure is logged, never rolled back
-     into A, so a flaky LLM call cannot break the conversation.
+  B) nodes + edges        — best-effort, user-role only; failure is logged,
+     never rolled back into A. Skipped for assistant slices to halve LLM
+     cost per turn (PRINCIPLES.md principle 2); they stay retrievable
+     through stage A's vector index.
 """
 
 from __future__ import annotations
@@ -25,7 +27,6 @@ def _save(text: str, role: str, turn_id: str, cx: sqlite3.Connection) -> str:
     now = int(time.time())
     vector = embed(text, cx)
 
-    # Stage A — slice + searchable vector. Must succeed.
     with store.tx(cx):
         cx.execute(
             "INSERT INTO slices(id, role, text, turn_id, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -35,36 +36,30 @@ def _save(text: str, role: str, turn_id: str, cx: sqlite3.Connection) -> str:
             "INSERT INTO vec_slices(slice_id, embedding) VALUES (?, ?)", (sid, vector)
         )
 
-    # Stage B — concept graph. Best-effort: a failure here leaves stage A intact.
-    # Skipped for assistant messages: the cost of a second LLM call per turn is
-    # not justified by the marginal recall gain (PRINCIPLES.md principle 2).
-    # Assistant slices stay retrievable via stage A's vector index.
     nodes_added = edges_added = 0
     if role == "user":
         try:
-            graph = concept.extract(text)
+            g = concept.extract(text)
             with store.tx(cx):
-                for node in graph.nodes:
+                for n in g.nodes:
                     cx.execute(
-                        "INSERT OR IGNORE INTO nodes(id, name, kind, first_seen) "
-                        "VALUES (?, ?, ?, ?)",
-                        (ulid(), node.name, node.kind, now),
+                        "INSERT OR IGNORE INTO nodes(id, name, kind, first_seen) VALUES (?,?,?,?)",
+                        (ulid(), n.name, n.kind, now),
                     )
-                name_to_id: dict[str, str] = {}
-                for node in graph.nodes:
-                    row = cx.execute(
-                        "SELECT id FROM nodes WHERE name = ?", (node.name,)
-                    ).fetchone()
-                    if row is not None:
-                        name_to_id[node.name] = row[0]
+                name_to_id = {
+                    n.name: cx.execute(
+                        "SELECT id FROM nodes WHERE name = ?", (n.name,)
+                    ).fetchone()[0]
+                    for n in g.nodes
+                }
                 nodes_added = len(name_to_id)
-                for edge in graph.edges:
-                    src, dst = name_to_id.get(edge.src), name_to_id.get(edge.dst)
+                for e in g.edges:
+                    src, dst = name_to_id.get(e.src), name_to_id.get(e.dst)
                     if src and dst:
                         cx.execute(
                             "INSERT INTO edges(id, src, dst, type, slice_id, created_at) "
-                            "VALUES (?, ?, ?, ?, ?, ?)",
-                            (ulid(), src, dst, edge.type, sid, now),
+                            "VALUES (?,?,?,?,?,?)",
+                            (ulid(), src, dst, e.type, sid, now),
                         )
                         edges_added += 1
         except concept.ConceptExtractionFailed as exc:
@@ -72,15 +67,8 @@ def _save(text: str, role: str, turn_id: str, cx: sqlite3.Connection) -> str:
 
     ep = store.events_path(cx)
     if ep is not None:
-        events.append(
-            ep,
-            kind="ingest",
-            slice_id=sid,
-            role=role,
-            turn_id=turn_id,
-            nodes=nodes_added,
-            edges=edges_added,
-        )
+        events.append(ep, kind="ingest", slice_id=sid, role=role, turn_id=turn_id,
+                      nodes=nodes_added, edges=edges_added)
     return sid
 
 
