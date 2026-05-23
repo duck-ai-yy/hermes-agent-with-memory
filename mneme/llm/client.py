@@ -20,6 +20,17 @@ from ..trace import events
 
 
 @dataclass(frozen=True)
+class Usage:
+    """Real token counts returned by the provider, not estimates."""
+    prompt_tokens: int
+    completion_tokens: int
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True)
 class LLMConfig:
     # Chat provider.
     provider: str = "ollama"            # "ollama" | "openai" | "anthropic"
@@ -86,6 +97,9 @@ class LLMClient:
         self._embed_http = httpx.Client(
             base_url=config.effective_embed_base_url, timeout=120.0
         )
+        # Populated after every chat call (None until the first call).
+        # For streams, only set once the iterator is exhausted.
+        self.last_usage: Usage | None = None
 
     def _is_cloud(self, provider: str) -> bool:
         return provider != "ollama"
@@ -110,8 +124,14 @@ class LLMClient:
         return {"Authorization": f"Bearer {key}"} if key else {}
 
     def chat(self, messages: list[dict], *, stream: bool = True):
-        """Chat completion. Returns a token iterator if stream else the full string."""
+        """Chat completion. Returns a token iterator if stream else the full string.
+
+        `self.last_usage` is populated with real token counts once the call
+        completes (immediately for non-stream, after iterator exhaustion for
+        stream). It is None if the provider did not return usage.
+        """
         self._audit("chat", sum(len(m.get("content", "")) for m in messages))
+        self.last_usage = None
         if self.config.provider == "anthropic":
             return self._chat_anthropic(messages, stream)
         payload = {"model": self.config.chat_model, "messages": messages, "stream": stream}
@@ -119,12 +139,16 @@ class LLMClient:
             if not stream:
                 r = self._http.post("/api/chat", json=payload)
                 r.raise_for_status()
-                return r.json()["message"]["content"]
+                body = r.json()
+                self.last_usage = _usage_from_ollama(body)
+                return body["message"]["content"]
             return self._stream_ollama(payload)
         if not stream:
             r = self._http.post("/v1/chat/completions", json=payload, headers=self._headers())
             r.raise_for_status()
-            return r.json()["choices"][0]["message"]["content"]
+            body = r.json()
+            self.last_usage = _usage_from_openai(body)
+            return body["choices"][0]["message"]["content"]
         return self._stream_openai(payload)
 
     def embed(self, text: str) -> bytes:
@@ -158,9 +182,13 @@ class LLMClient:
                 if chunk:
                     yield chunk
                 if obj.get("done"):
+                    self.last_usage = _usage_from_ollama(obj)
                     break
 
     def _stream_openai(self, payload: dict) -> Iterator[str]:
+        # `stream_options.include_usage` makes OpenAI emit a final chunk with
+        # `usage` populated; without it the stream gives no token counts.
+        payload = {**payload, "stream_options": {"include_usage": True}}
         with self._http.stream(
             "POST", "/v1/chat/completions", json=payload, headers=self._headers()
         ) as r:
@@ -171,9 +199,14 @@ class LLMClient:
                 data = line[6:]
                 if data == "[DONE]":
                     break
-                delta = json.loads(data)["choices"][0]["delta"].get("content", "")
-                if delta:
-                    yield delta
+                obj = json.loads(data)
+                choices = obj.get("choices") or []
+                if choices:
+                    delta = choices[0].get("delta", {}).get("content", "")
+                    if delta:
+                        yield delta
+                if obj.get("usage"):
+                    self.last_usage = _usage_from_openai(obj)
 
     # -- Anthropic --------------------------------------------------------
     # /v1/messages takes `system` as a top-level string, not a message role;
@@ -203,17 +236,44 @@ class LLMClient:
         if not stream:
             r = self._http.post("/v1/messages", json=body, headers=headers)
             r.raise_for_status()
-            return r.json()["content"][0]["text"]
+            payload = r.json()
+            self.last_usage = _usage_from_anthropic(payload)
+            return payload["content"][0]["text"]
         return self._stream_anthropic(body, headers)
 
     def _stream_anthropic(self, body: dict, headers: dict) -> Iterator[str]:
+        # message_start carries input_tokens; message_delta carries the final
+        # output_tokens. Combine them at the end.
+        input_tokens = 0
         with self._http.stream("POST", "/v1/messages", json=body, headers=headers) as r:
             r.raise_for_status()
             for line in r.iter_lines():
                 if not line or not line.startswith("data: "):
                     continue
                 obj = json.loads(line[6:])
-                if obj.get("type") == "content_block_delta":
+                t = obj.get("type")
+                if t == "content_block_delta":
                     delta = obj.get("delta", {}).get("text", "")
                     if delta:
                         yield delta
+                elif t == "message_start":
+                    input_tokens = (
+                        obj.get("message", {}).get("usage", {}).get("input_tokens", 0)
+                    )
+                elif t == "message_delta":
+                    output_tokens = obj.get("usage", {}).get("output_tokens", 0)
+                    self.last_usage = Usage(input_tokens, output_tokens)
+
+
+def _usage_from_ollama(obj: dict) -> Usage:
+    return Usage(obj.get("prompt_eval_count", 0), obj.get("eval_count", 0))
+
+
+def _usage_from_openai(obj: dict) -> Usage:
+    u = obj.get("usage") or {}
+    return Usage(u.get("prompt_tokens", 0), u.get("completion_tokens", 0))
+
+
+def _usage_from_anthropic(obj: dict) -> Usage:
+    u = obj.get("usage") or {}
+    return Usage(u.get("input_tokens", 0), u.get("output_tokens", 0))

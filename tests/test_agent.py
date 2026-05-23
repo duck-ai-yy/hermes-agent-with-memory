@@ -60,3 +60,48 @@ def test_respond_marks_fabricated_when_citation_does_not_resolve(cx, fake_llm):
     fake_llm.reply = "the answer [^DOES_NOT_EXIST]"
     reply = agent.respond("anything", "turn1", cx)
     assert reply.citation_quality == "fabricated"
+
+
+def test_respond_stream_yields_chunks_then_returns_reply(cx, fake_llm):
+    """The generator yields incremental chunks; StopIteration.value is the Reply."""
+    fake_llm.reply = "streamed response"
+    gen = agent.respond_stream("hi", "turn1", cx)
+    chunks: list[str] = []
+    reply = None
+    while True:
+        try:
+            chunks.append(next(gen))
+        except StopIteration as stop:
+            reply = stop.value
+            break
+
+    assert len(chunks) >= 2  # FakeLLM splits into multiple chunks
+    assert "".join(chunks) == "streamed response"
+    assert reply.text == "streamed response"
+    assert len(reply.trace_id) == 26
+    # Assistant message persisted just like non-streaming respond.
+    roles = {r[0] for r in cx.execute("SELECT role FROM slices")}
+    assert {"user", "assistant"} <= roles
+
+
+def test_respond_stream_writes_real_token_counts_to_trace(cx, fake_llm, tmp_path):
+    """Token fields land on the closing trace event so `stats` can sum them."""
+    gen = agent.respond_stream("count me", "turn1", cx)
+    try:
+        while True:
+            next(gen)
+    except StopIteration as stop:
+        reply = stop.value
+
+    record = events.explain(tmp_path / "events.jsonl", reply.trace_id)
+    assert record["prompt_tokens"] == fake_llm.last_usage.prompt_tokens
+    assert record["completion_tokens"] == fake_llm.last_usage.completion_tokens
+    assert record["total_tokens"] == fake_llm.last_usage.total_tokens
+
+
+def test_respond_non_stream_also_writes_token_counts_to_trace(cx, fake_llm, tmp_path):
+    """Symmetry: non-streaming respond captures usage the same way."""
+    reply = agent.respond("usage too", "turn1", cx)
+    record = events.explain(tmp_path / "events.jsonl", reply.trace_id)
+    assert "prompt_tokens" in record
+    assert record["total_tokens"] == fake_llm.last_usage.total_tokens

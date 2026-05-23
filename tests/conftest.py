@@ -23,13 +23,36 @@ class FakeLLM:
         self.reply = "noted"
         self.embed_calls = 0
         self.chat_calls = 0
+        self.last_usage: SimpleNamespace | None = None
 
     def chat(self, messages: list[dict], *, stream: bool = True):
         self.chat_calls += 1
+        self.last_usage = None
         system = messages[0]["content"]
-        if "STRICT JSON" in system:
-            return self.concept_json
-        return self.reply
+        text = self.concept_json if "STRICT JSON" in system else self.reply
+        if not stream:
+            self.last_usage = self._fake_usage(text)
+            return text
+        return self._stream_chunks(text)
+
+    def _stream_chunks(self, text: str):
+        # Three roughly-equal chunks — enough to exercise the streaming path
+        # without making test assertions chunk-boundary-sensitive.
+        n = 3
+        if len(text) < n:
+            yield text
+        else:
+            step = len(text) // n
+            for i in range(n):
+                start = i * step
+                end = start + step if i < n - 1 else len(text)
+                yield text[start:end]
+        self.last_usage = self._fake_usage(text)
+
+    @staticmethod
+    def _fake_usage(text: str) -> SimpleNamespace:
+        p, c = 10, max(1, len(text) // 4)
+        return SimpleNamespace(prompt_tokens=p, completion_tokens=c, total_tokens=p + c)
 
     def embed(self, text: str) -> bytes:
         self.embed_calls += 1

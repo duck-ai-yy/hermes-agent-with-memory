@@ -1,6 +1,8 @@
 """Chat loop: ingest -> retrieve -> build prompt -> LLM call -> persist.
 
 The five stages mirror the event flow in README.md and docs/MEMORY.md.
+`respond` returns the full reply; `respond_stream` yields chunks and returns
+the same Reply via StopIteration.value once exhausted.
 """
 
 from __future__ import annotations
@@ -8,6 +10,7 @@ from __future__ import annotations
 import re
 import sqlite3
 from dataclasses import dataclass
+from typing import Iterator
 
 from . import soul
 from .ids import ulid
@@ -58,8 +61,8 @@ def build_prompt(user_text: str, slices: list, blueprint: str) -> tuple[str, str
     return stable_prefix, f"{header}\n{body}\n\nUSER: {user_text}"
 
 
-def respond(user_text: str, turn_id: str, cx: sqlite3.Connection) -> Reply:
-    """Run one full chat turn."""
+def _open_turn(user_text: str, turn_id: str, cx: sqlite3.Connection):
+    """Stages 1-3: ingest, retrieve, build prompt; write the pre-call trace."""
     user_sid = ingest.save_user_message(user_text, turn_id, cx)
     # Exclude the just-ingested user slice from its own retrieval; otherwise
     # vector search returns it first and the LLM thinks the user is repeating.
@@ -76,16 +79,49 @@ def respond(user_text: str, turn_id: str, cx: sqlite3.Connection) -> Reply:
                       used_slices=[s.id for s in slices],
                       prompt_hash=soul.prompt_hash(prefix + "\n" + suffix),
                       model=client.config.chat_model, provider=client.config.provider)
+    return slices, prefix, suffix, trace_id, client, ep
 
+
+def _close_turn(reply_text, slices, trace_id, client, ep, turn_id, cx) -> Reply:
+    """Stages 4-5: classify, persist assistant message, close the trace."""
+    citation_quality = _classify_citations(reply_text, [s.id for s in slices])
+    ingest.save_assistant_message(reply_text, turn_id, cx)
+    if ep is not None:
+        usage = getattr(client, "last_usage", None)
+        extra: dict = {}
+        if usage is not None:
+            extra = {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+            }
+        events.append(ep, kind="trace", id=trace_id,
+                      response_hash=soul.prompt_hash(reply_text),
+                      citation_quality=citation_quality, **extra)
+    return Reply(reply_text, trace_id, citation_quality)
+
+
+def respond(user_text: str, turn_id: str, cx: sqlite3.Connection) -> Reply:
+    """Run one full chat turn (non-streaming)."""
+    slices, prefix, suffix, trace_id, client, ep = _open_turn(user_text, turn_id, cx)
     reply_text = client.chat(
         [{"role": "system", "content": prefix}, {"role": "user", "content": suffix}],
         stream=False,
     )
-    citation_quality = _classify_citations(reply_text, [s.id for s in slices])
+    return _close_turn(reply_text, slices, trace_id, client, ep, turn_id, cx)
 
-    ingest.save_assistant_message(reply_text, turn_id, cx)
-    if ep is not None:
-        events.append(ep, kind="trace", id=trace_id,
-                      response_hash=soul.prompt_hash(reply_text),
-                      citation_quality=citation_quality)
-    return Reply(reply_text, trace_id, citation_quality)
+
+def respond_stream(
+    user_text: str, turn_id: str, cx: sqlite3.Connection,
+) -> Iterator[str]:
+    """Streaming variant: yields text chunks; returns the Reply via
+    StopIteration.value once the iterator is exhausted."""
+    slices, prefix, suffix, trace_id, client, ep = _open_turn(user_text, turn_id, cx)
+    chunks: list[str] = []
+    for chunk in client.chat(
+        [{"role": "system", "content": prefix}, {"role": "user", "content": suffix}],
+        stream=True,
+    ):
+        chunks.append(chunk)
+        yield chunk
+    return _close_turn("".join(chunks), slices, trace_id, client, ep, turn_id, cx)
