@@ -118,14 +118,27 @@ User msg
 / OpenRouter 等），用环境变量覆盖默认：
 
 ```sh
+# 例 1：DeepSeek（chat-only，embed 走 hash 兜底，仅精确文本召回）
 export MNEME_PROVIDER=openai
 export MNEME_BASE_URL=https://api.deepseek.com
 export MNEME_API_KEY=sk-...
 export MNEME_CHAT_MODEL=deepseek-chat
-# DeepSeek 不提供 embeddings → 本地 hash 兜底（仅支持精确文本召回，无语义聚类）
 export MNEME_EMBED_VIA=hash
 mneme init && mneme chat
+
+# 例 2：Anthropic chat + OpenAI embed（chat / embed 可独立配置）
+export MNEME_PROVIDER=anthropic
+export MNEME_BASE_URL=https://api.anthropic.com
+export MNEME_API_KEY=sk-ant-...
+export MNEME_CHAT_MODEL=claude-haiku-4-5
+export MNEME_EMBED_PROVIDER=openai
+export MNEME_EMBED_BASE_URL=https://api.openai.com
+export MNEME_EMBED_API_KEY=sk-...
+export MNEME_EMBED_MODEL=text-embedding-3-small
 ```
+
+embed env 不设时回退到 chat 同套。OpenAI 兼容的 embed 请求带 `dimensions=768`，
+和 `vec_slices FLOAT[768]` schema 对齐。
 
 所有 cloud 调用都会在 `~/.mneme/events.jsonl` 先写一条 `audit` 事件（provider /
 endpoint / model / 估算 token），API key 本身**不会**被记录。

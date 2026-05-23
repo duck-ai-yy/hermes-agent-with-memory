@@ -29,8 +29,11 @@ _ENV_FIELDS = {
     "MNEME_PROVIDER": "provider",
     "MNEME_BASE_URL": "base_url",
     "MNEME_CHAT_MODEL": "chat_model",
-    "MNEME_EMBED_MODEL": "embed_model",
     "MNEME_API_KEY": "api_key",
+    "MNEME_EMBED_MODEL": "embed_model",
+    "MNEME_EMBED_PROVIDER": "embed_provider",
+    "MNEME_EMBED_BASE_URL": "embed_base_url",
+    "MNEME_EMBED_API_KEY": "embed_api_key",
     "MNEME_EMBED_VIA": "embed_via",
 }
 

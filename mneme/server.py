@@ -20,7 +20,7 @@ from .memory import forget as forget_mod
 from .memory import store
 from .trace import events
 
-app = FastAPI(title="Mneme", version="0.2.0")
+app = FastAPI(title="Mneme", version="0.3.0")
 
 
 class ChatRequest(BaseModel):

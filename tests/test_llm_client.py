@@ -14,10 +14,14 @@ import httpx
 from mneme.llm.client import LLMClient, LLMConfig
 
 
-def _client_with(handler, **cfg_kwargs) -> LLMClient:
+def _client_with(handler, embed_handler=None, **cfg_kwargs) -> LLMClient:
     cfg = LLMConfig(**cfg_kwargs)
     client = LLMClient(cfg)
     client._http = httpx.Client(base_url=cfg.base_url, transport=httpx.MockTransport(handler))
+    client._embed_http = httpx.Client(
+        base_url=cfg.effective_embed_base_url,
+        transport=httpx.MockTransport(embed_handler or handler),
+    )
     return client
 
 
@@ -52,6 +56,54 @@ def test_openai_chat_uses_v1_endpoint_and_bearer_auth():
     assert reply == "openai said hi"
     assert seen["path"] == "/v1/chat/completions"
     assert seen["auth"] == "Bearer sk-test"
+
+
+def test_openai_embed_requests_768_dimensions_to_fit_schema():
+    """Our vec_slices table is FLOAT[768]; OpenAI text-embedding-3-small is
+    native 1536-d. Asking for `dimensions: 768` keeps the schema stable."""
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"data": [{"embedding": [0.1] * 768}]})
+
+    client = _client_with(
+        handler, provider="openai", api_key="sk-test", base_url="https://x",
+        embed_model="text-embedding-3-small",
+    )
+    blob = client.embed("hello")
+    assert len(blob) == 768 * 4  # float32
+    assert seen["path"] == "/v1/embeddings"
+    assert seen["body"]["dimensions"] == 768
+    assert seen["body"]["model"] == "text-embedding-3-small"
+
+
+def test_embed_provider_can_differ_from_chat_provider():
+    """Anthropic chat + OpenAI embed — the canonical decoupled setup."""
+    chat_hits, embed_hits = [], []
+
+    def chat_handler(request: httpx.Request) -> httpx.Response:
+        chat_hits.append(request.url.host)
+        return httpx.Response(
+            200, json={"content": [{"type": "text", "text": "ok"}]},
+        )
+
+    def embed_handler(request: httpx.Request) -> httpx.Response:
+        embed_hits.append(request.url.host)
+        return httpx.Response(200, json={"data": [{"embedding": [0.0] * 768}]})
+
+    client = _client_with(
+        chat_handler, embed_handler=embed_handler,
+        provider="anthropic", base_url="https://api.anthropic.com",
+        api_key="sk-ant-test", chat_model="claude-haiku-4-5",
+        embed_provider="openai", embed_base_url="https://api.openai.com",
+        embed_api_key="sk-test", embed_model="text-embedding-3-small",
+    )
+    client.chat([{"role": "user", "content": "hi"}], stream=False)
+    client.embed("hello")
+    assert chat_hits == ["api.anthropic.com"]
+    assert embed_hits == ["api.openai.com"]
 
 
 def test_anthropic_chat_splits_system_and_uses_messages_endpoint():

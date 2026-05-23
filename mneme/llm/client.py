@@ -21,16 +21,38 @@ from ..trace import events
 
 @dataclass(frozen=True)
 class LLMConfig:
+    # Chat provider.
     provider: str = "ollama"            # "ollama" | "openai" | "anthropic"
     base_url: str = "http://127.0.0.1:11434"
     chat_model: str = "qwen2.5:7b"
+    api_key: str | None = None          # required only for cloud chat
+
+    # Embed provider — may differ from chat (e.g. Anthropic for chat,
+    # OpenAI for embed, since Anthropic has no embeddings endpoint).
+    # Each `embed_*` field falls back to its chat counterpart when None.
     embed_model: str = "nomic-embed-text"
-    api_key: str | None = None          # required only for cloud providers
-    events_path: Path | None = None     # where audit events are written
-    embed_via: str = "provider"         # "provider" | "hash" — hash = local stdlib
-                                        # fallback for providers without embeddings
-                                        # (e.g. DeepSeek); degrades recall to
+    embed_provider: str | None = None   # None -> reuse `provider`
+    embed_base_url: str | None = None   # None -> reuse `base_url`
+    embed_api_key: str | None = None    # None -> reuse `api_key`
+    embed_via: str = "provider"         # "provider" | "hash" — hash = local
+                                        # stdlib fallback for providers
+                                        # without embeddings (DeepSeek,
+                                        # Anthropic); degrades recall to
                                         # exact-text matches only.
+
+    events_path: Path | None = None     # where audit events are written
+
+    @property
+    def effective_embed_provider(self) -> str:
+        return self.embed_provider or self.provider
+
+    @property
+    def effective_embed_base_url(self) -> str:
+        return self.embed_base_url or self.base_url
+
+    @property
+    def effective_embed_api_key(self) -> str | None:
+        return self.embed_api_key or self.api_key
 
 
 _INSTANCE: "LLMClient | None" = None
@@ -59,23 +81,33 @@ class LLMClient:
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
         self._http = httpx.Client(base_url=config.base_url, timeout=120.0)
+        # Separate embed client so chat and embed can hit different hosts
+        # (Anthropic chat + OpenAI embed is the canonical case).
+        self._embed_http = httpx.Client(
+            base_url=config.effective_embed_base_url, timeout=120.0
+        )
 
-    @property
-    def _is_cloud(self) -> bool:
-        return self.config.provider != "ollama"
+    def _is_cloud(self, provider: str) -> bool:
+        return provider != "ollama"
 
     def _audit(self, endpoint: str, payload_chars: int) -> None:
         """Record an outbound cloud call before it happens (principle 4)."""
-        if self._is_cloud and self.config.events_path is not None:
+        provider = (self.config.effective_embed_provider
+                    if endpoint == "embed" else self.config.provider)
+        if self._is_cloud(provider) and self.config.events_path is not None:
             events.append(
                 self.config.events_path, kind="audit",
-                provider=self.config.provider, endpoint=endpoint,
+                provider=provider, endpoint=endpoint,
                 model=self.config.chat_model if endpoint == "chat" else self.config.embed_model,
                 est_tokens=payload_chars // 4,
             )
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.config.api_key}"} if self.config.api_key else {}
+
+    def _embed_headers(self) -> dict[str, str]:
+        key = self.config.effective_embed_api_key
+        return {"Authorization": f"Bearer {key}"} if key else {}
 
     def chat(self, messages: list[dict], *, stream: bool = True):
         """Chat completion. Returns a token iterator if stream else the full string."""
@@ -102,12 +134,16 @@ class LLMClient:
             rng = random.Random(hashlib.sha256(text.encode()).digest())
             return _pack([rng.random() for _ in range(768)])
         self._audit("embed", len(text))
-        body = {"model": self.config.embed_model, "input": text}
-        if self.config.provider == "ollama":
-            r = self._http.post("/api/embed", json=body)
+        provider = self.config.effective_embed_provider
+        body: dict = {"model": self.config.embed_model, "input": text}
+        if provider == "ollama":
+            r = self._embed_http.post("/api/embed", json=body)
             r.raise_for_status()
             return _pack(r.json()["embeddings"][0])
-        r = self._http.post("/v1/embeddings", json=body, headers=self._headers())
+        # OpenAI-compatible. `dimensions: 768` truncates 1536-d models like
+        # text-embedding-3-small to fit our vec_slices FLOAT[768] schema.
+        body["dimensions"] = 768
+        r = self._embed_http.post("/v1/embeddings", json=body, headers=self._embed_headers())
         r.raise_for_status()
         return _pack(r.json()["data"][0]["embedding"])
 
