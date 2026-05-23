@@ -32,6 +32,25 @@ def test_ingest_builds_concept_graph(cx, fake_llm):
     assert cx.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 1
 
 
+def test_assistant_message_skips_concept_extraction(cx, fake_llm):
+    """Stage B is user-only — assistant slices stay retrievable via the vector
+    index but cost no extra LLM call (PRINCIPLES.md principle 2)."""
+    fake_llm.concept_json = (
+        '{"nodes": [{"name": "Tauri", "kind": "artifact"},'
+        '            {"name": "desktop app", "kind": "concept"}],'
+        ' "edges": [{"src": "Tauri", "type": "PART_OF", "dst": "desktop app"}]}'
+    )
+    chat_calls_before = fake_llm.chat_calls
+    sid = ingest.save_assistant_message("Tauri powers the desktop app", "turn1", cx)
+    # Stage A ran: slice + vector are searchable.
+    assert cx.execute("SELECT text FROM slices WHERE id=?", (sid,)).fetchone() is not None
+    assert cx.execute("SELECT 1 FROM vec_slices WHERE slice_id=?", (sid,)).fetchone() is not None
+    # Stage B did NOT run: no concept-extraction LLM call, no nodes, no edges.
+    assert fake_llm.chat_calls == chat_calls_before
+    assert cx.execute("SELECT COUNT(*) FROM nodes").fetchone()[0] == 0
+    assert cx.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 0
+
+
 def test_concept_failure_does_not_lose_the_slice(cx, fake_llm):
     fake_llm.concept_json = "this is not json"  # stage B will fail
     sid = ingest.save_user_message("a flaky turn", "turn1", cx)

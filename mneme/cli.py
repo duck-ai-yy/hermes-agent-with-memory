@@ -17,7 +17,7 @@ import typer
 from . import paths
 from .agent import respond
 from .ids import ulid
-from .llm.client import LLMConfig, get_client
+from .llm.client import LLMConfig, configure
 from .memory import forget as forget_mod
 from .memory import store
 from .trace import events
@@ -27,7 +27,7 @@ app = typer.Typer(add_completion=False, help="Local-first chat agent with memory
 
 def _configure_llm() -> None:
     """Build the singleton LLM client with the audit log wired in."""
-    get_client(LLMConfig(events_path=paths.EVENTS_PATH))
+    configure(LLMConfig(events_path=paths.EVENTS_PATH))
 
 
 def _open_db():

@@ -20,7 +20,7 @@ class FakeLLM:
             chat_model="fake-chat", embed_model="fake-embed", provider="ollama"
         )
         self.concept_json = '{"nodes": [], "edges": []}'
-        self.reply = "noted [^abc]"
+        self.reply = "noted"
         self.embed_calls = 0
         self.chat_calls = 0
 
@@ -40,7 +40,7 @@ class FakeLLM:
 @pytest.fixture
 def fake_llm(monkeypatch):
     llm = FakeLLM()
-    monkeypatch.setattr("mneme.llm.client.get_client", lambda *a, **k: llm)
+    monkeypatch.setattr("mneme.llm.client.get_client", lambda: llm)
     return llm
 
 

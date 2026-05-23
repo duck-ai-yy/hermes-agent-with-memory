@@ -6,6 +6,7 @@ flow in README.md and docs/MEMORY.md.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 
@@ -15,12 +16,32 @@ from .llm import client as _llm
 from .memory import ingest, retrieve, store
 from .trace import events
 
+# A citation marker; the body is anything up to the closing bracket so we can
+# detect both well-formed ULID ids and any garbage the LLM might fabricate.
+_CITATION_RE = re.compile(r"\[\^([^\]]+)\]")
+
+
+def _classify_citations(reply_text: str, slice_ids: list[str]) -> str:
+    """Return "explicit" | "coarse" | "fabricated".
+
+    coarse     — no [^id] markers at all
+    explicit   — every marker resolves to a slice id we actually retrieved
+    fabricated — at least one marker does not resolve (blueprint forbids this)
+    """
+    markers = _CITATION_RE.findall(reply_text)
+    if not markers:
+        return "coarse"
+    known = set(slice_ids)
+    if all(m in known for m in markers):
+        return "explicit"
+    return "fabricated"
+
 
 @dataclass(frozen=True)
 class Reply:
     text: str
     trace_id: str
-    citation_quality: str          # "explicit" | "coarse"
+    citation_quality: str          # "explicit" | "coarse" | "fabricated"
 
 
 def build_prompt(user_text: str, slices: list, blueprint: str) -> tuple[str, str]:
@@ -83,7 +104,7 @@ def respond(user_text: str, turn_id: str, cx: sqlite3.Connection) -> Reply:
         )
 
     reply_text = client.chat(messages, stream=False)
-    citation_quality = "explicit" if "[^" in reply_text else "coarse"
+    citation_quality = _classify_citations(reply_text, [s.id for s in slices])
 
     # ⑤ persist the assistant reply; close out the trace.
     ingest.save_assistant_message(reply_text, turn_id, cx)
