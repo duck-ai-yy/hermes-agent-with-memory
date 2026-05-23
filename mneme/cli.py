@@ -7,16 +7,19 @@ In-process and ephemeral: a command runs and exits. Only `serve` is long-lived.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 import time
 
 import httpx
 import typer
 
 from . import paths
-from .agent import respond
+from .agent import respond_stream
 from .ids import ulid
+from .llm import client as _llm
 from .llm.client import LLMConfig, configure
 from .memory import forget as forget_mod
 from .memory import store
@@ -121,17 +124,38 @@ def chat() -> None:
             continue
 
         try:
-            reply = respond(line, turn_id, cx)
+            reply = _stream_to_stdout(line, turn_id, cx)
         except Exception as exc:  # provider down, etc.
-            typer.secho(f"error: {exc}", fg=typer.colors.RED)
+            typer.secho(f"\nerror: {exc}", fg=typer.colors.RED)
             continue
         last_trace = reply.trace_id
-        typer.echo(f"mneme> {reply.text}")
+        usage = getattr(_llm.get_client(), "last_usage", None)
+        tokens_part = f" · tokens: {usage.total_tokens}" if usage else ""
         typer.secho(
-            f"       [trace {reply.trace_id} · citations: {reply.citation_quality}]",
+            f"       [trace {reply.trace_id} · citations: "
+            f"{reply.citation_quality}{tokens_part}]",
             fg=typer.colors.BRIGHT_BLACK,
         )
     cx.close()
+
+
+def _stream_to_stdout(user_text: str, turn_id: str, cx):
+    """Drive `respond_stream`, printing chunks live; return the final Reply."""
+    sys.stdout.write("mneme> ")
+    sys.stdout.flush()
+    gen = respond_stream(user_text, turn_id, cx)
+    reply = None
+    while True:
+        try:
+            chunk = next(gen)
+        except StopIteration as stop:
+            reply = stop.value
+            break
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return reply
 
 
 @app.command()
@@ -170,7 +194,7 @@ def blueprint() -> None:
 
 @app.command()
 def stats() -> None:
-    """Print slice / node / edge counts and database size."""
+    """Print slice / node / edge counts, database size, and lifetime tokens."""
     cx = _open_db()
     for table in ("slices", "nodes", "edges"):
         count = cx.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -178,6 +202,33 @@ def stats() -> None:
     cx.close()
     size = paths.DB_PATH.stat().st_size
     typer.echo(f"db size  {size / 1024:.1f} KiB")
+    totals = _token_totals(paths.EVENTS_PATH)
+    typer.echo(
+        f"tokens   in: {totals['prompt']:,}  out: {totals['completion']:,}  "
+        f"total: {totals['total']:,}"
+    )
+
+
+def _token_totals(events_path) -> dict:
+    """Sum real token counts across all trace events. Missing fields = 0."""
+    totals = {"prompt": 0, "completion": 0, "total": 0}
+    if not events_path.exists():
+        return totals
+    with open(events_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("kind") != "trace":
+                continue
+            totals["prompt"] += rec.get("prompt_tokens", 0)
+            totals["completion"] += rec.get("completion_tokens", 0)
+            totals["total"] += rec.get("total_tokens", 0)
+    return totals
 
 
 @app.command()
