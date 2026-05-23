@@ -1,8 +1,10 @@
-"""Soul layer: the agent's identity, loaded from version-controlled text.
+"""Soul layer: the agent's identity, loaded from user-local text files.
 
 `blueprint.md` goes verbatim into the stable prompt prefix; `prompts/*.yaml`
-are the externalized prompt templates. Keeping identity in files rather than
-in `.py` is what makes it diffable and recoverable (PRINCIPLES.md principle 5).
+are the externalized prompt templates. Identity lives in `~/.mneme/`, NOT in
+the repo — the repo only ships `examples/` templates used as a one-time seed
+by `mneme init`. Diff your identity in your own private repo, if you want;
+the public code never carries it (PRINCIPLES.md principle 4).
 
 This module only *loads* — it never mutates identity.
 """
@@ -19,21 +21,32 @@ from . import paths
 
 @functools.cache
 def load_prompt(name: str) -> dict:
-    """Load and parse `prompts/{name}.yaml`.
+    """Load and parse a prompt template by name.
+
+    Prefers the runtime copy at `~/.mneme/prompts/{name}.yaml`; falls back to
+    the repo's `examples/prompts/{name}.yaml` so fresh checkouts and tests
+    work before `mneme init` has seeded the runtime location.
 
     Cached because prompts are immutable within a process (no hot-reload per
     PRINCIPLE 2: stable prefix preserves cache hits).
     """
-    return yaml.safe_load((paths.PROMPTS_DIR / f"{name}.yaml").read_text(encoding="utf-8"))
+    for candidate in (
+        paths.PROMPTS_DIR / f"{name}.yaml",
+        paths.EXAMPLE_PROMPTS_DIR / f"{name}.yaml",
+    ):
+        if candidate.exists():
+            return yaml.safe_load(candidate.read_text(encoding="utf-8"))
+    raise FileNotFoundError(f"no prompt {name!r} found; run `mneme init`")
 
 
 def load_blueprint() -> str:
     """Return the system blueprint text.
 
-    Prefers the user-editable runtime copy (`~/.mneme/blueprint.md`, written by
-    `mneme init`); falls back to the repo copy so the agent works pre-init.
+    Prefers the user-editable runtime copy (`~/.mneme/blueprint.md`, written
+    by `mneme init`); falls back to the repo example so fresh checkouts and
+    tests work pre-init.
     """
-    for candidate in (paths.BLUEPRINT_PATH, paths.PROJECT_BLUEPRINT):
+    for candidate in (paths.BLUEPRINT_PATH, paths.EXAMPLE_BLUEPRINT):
         if candidate.exists():
             return candidate.read_text(encoding="utf-8")
     raise FileNotFoundError("no blueprint.md found; run `mneme init`")

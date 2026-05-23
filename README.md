@@ -26,7 +26,10 @@ pip install -e .
 mneme init
 ```
 
-`init` 会检测本地 Ollama、在 `~/.mneme/` 下创建 `db.sqlite`、`blueprint.md`、`events.jsonl`。
+`init` 会检测本地 Ollama，并在 `~/.mneme/` 下创建 `db.sqlite`、`events.jsonl`，以及从仓库
+`examples/` 种入 `blueprint.md` 和 `prompts/*.yaml`。**身份（blueprint + prompts）从此归你**
+—— 编辑 `~/.mneme/blueprint.md` 与 `~/.mneme/prompts/*.yaml` 即生效；仓库里的 `examples/`
+只在首次 init 时被读一次，之后不再回头。
 
 ## 使用
 
@@ -75,8 +78,9 @@ mneme/
 │   └─ client.py       httpx singleton（Ollama / OpenAI opt-in）
 └─ trace/
     └─ events.py       events.jsonl 单一 append-only 日志
-prompts/*.yaml         外置 prompt（版本化，prompt_hash 入 trace）
-blueprint.md           系统蓝图（启动时整段注入 system prefix）
+examples/              用户本地身份的种子模板（首次 init 拷到 ~/.mneme/，仓库不持续承载身份）
+  ├─ prompts/*.yaml    prompt 模板（运行时改 ~/.mneme/prompts/）
+  └─ blueprint.md      blueprint 模板（运行时改 ~/.mneme/blueprint.md）
 ```
 
 ### 一次 chat turn 的事件流

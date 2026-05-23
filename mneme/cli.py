@@ -50,8 +50,9 @@ def _open_db():
 
 @app.command()
 def init() -> None:
-    """Detect Ollama, create ~/.mneme/{db.sqlite,blueprint.md,events.jsonl}."""
+    """Create ~/.mneme/ (db, blueprint, prompts, events) and detect Ollama."""
     paths.HOME.mkdir(parents=True, exist_ok=True)
+    paths.PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
     cx = store.connect(paths.DB_PATH)
     store.init_db(cx)
@@ -60,9 +61,17 @@ def init() -> None:
 
     if not paths.BLUEPRINT_PATH.exists():
         paths.BLUEPRINT_PATH.write_text(
-            paths.PROJECT_BLUEPRINT.read_text(encoding="utf-8"), encoding="utf-8"
+            paths.EXAMPLE_BLUEPRINT.read_text(encoding="utf-8"), encoding="utf-8"
         )
     typer.echo(f"blueprint {paths.BLUEPRINT_PATH}")
+
+    seeded = 0
+    for src in paths.EXAMPLE_PROMPTS_DIR.glob("*.yaml"):
+        dst = paths.PROMPTS_DIR / src.name
+        if not dst.exists():
+            dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+            seeded += 1
+    typer.echo(f"prompts   {paths.PROMPTS_DIR} ({seeded} seeded)")
 
     paths.EVENTS_PATH.touch(exist_ok=True)
     typer.echo(f"events    {paths.EVENTS_PATH}")
