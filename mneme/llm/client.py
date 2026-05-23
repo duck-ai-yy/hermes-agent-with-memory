@@ -21,7 +21,7 @@ from ..trace import events
 
 @dataclass(frozen=True)
 class LLMConfig:
-    provider: str = "ollama"            # "ollama" | "openai"
+    provider: str = "ollama"            # "ollama" | "openai" | "anthropic"
     base_url: str = "http://127.0.0.1:11434"
     chat_model: str = "qwen2.5:7b"
     embed_model: str = "nomic-embed-text"
@@ -80,6 +80,8 @@ class LLMClient:
     def chat(self, messages: list[dict], *, stream: bool = True):
         """Chat completion. Returns a token iterator if stream else the full string."""
         self._audit("chat", sum(len(m.get("content", "")) for m in messages))
+        if self.config.provider == "anthropic":
+            return self._chat_anthropic(messages, stream)
         payload = {"model": self.config.chat_model, "messages": messages, "stream": stream}
         if self.config.provider == "ollama":
             if not stream:
@@ -136,3 +138,46 @@ class LLMClient:
                 delta = json.loads(data)["choices"][0]["delta"].get("content", "")
                 if delta:
                     yield delta
+
+    # -- Anthropic --------------------------------------------------------
+    # /v1/messages takes `system` as a top-level string, not a message role;
+    # response shape is content[0].text, not choices[0].message.content.
+    def _anthropic_headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": self.config.api_key or "",
+            "anthropic-version": "2023-06-01",
+        }
+
+    def _anthropic_body(self, messages: list[dict], stream: bool) -> dict:
+        system = next((m["content"] for m in messages if m.get("role") == "system"), None)
+        rest = [m for m in messages if m.get("role") != "system"]
+        body: dict = {
+            "model": self.config.chat_model,
+            "max_tokens": 1024,
+            "messages": rest,
+            "stream": stream,
+        }
+        if system:
+            body["system"] = system
+        return body
+
+    def _chat_anthropic(self, messages: list[dict], stream: bool):
+        body = self._anthropic_body(messages, stream)
+        headers = self._anthropic_headers()
+        if not stream:
+            r = self._http.post("/v1/messages", json=body, headers=headers)
+            r.raise_for_status()
+            return r.json()["content"][0]["text"]
+        return self._stream_anthropic(body, headers)
+
+    def _stream_anthropic(self, body: dict, headers: dict) -> Iterator[str]:
+        with self._http.stream("POST", "/v1/messages", json=body, headers=headers) as r:
+            r.raise_for_status()
+            for line in r.iter_lines():
+                if not line or not line.startswith("data: "):
+                    continue
+                obj = json.loads(line[6:])
+                if obj.get("type") == "content_block_delta":
+                    delta = obj.get("delta", {}).get("text", "")
+                    if delta:
+                        yield delta
