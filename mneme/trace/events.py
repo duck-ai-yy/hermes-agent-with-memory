@@ -49,3 +49,35 @@ def explain(log_path: Path, trace_id: str) -> dict:
     if not merged:
         raise KeyError(trace_id)
     return merged
+
+
+def today_start_ts() -> int:
+    """Local-time midnight as a Unix timestamp. Used for daily budget windows."""
+    now = time.localtime()
+    return int(time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1)))
+
+
+def sum_cloud_tokens_since(log_path: Path, since_ts: int) -> int:
+    """Sum `total_tokens` across trace events newer than `since_ts` whose
+    provider is non-local. Ollama and unknown-provider events are ignored —
+    only spend that costs real money counts."""
+    total = 0
+    if not log_path.exists():
+        return 0
+    with open(log_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("kind") != "trace":
+                continue
+            if record.get("ts", 0) < since_ts:
+                continue
+            if record.get("provider") in (None, "ollama"):
+                continue
+            total += record.get("total_tokens", 0)
+    return total

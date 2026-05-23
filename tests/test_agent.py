@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from mneme import agent
 from mneme.memory.retrieve import Slice
 from mneme.trace import events
@@ -105,3 +107,21 @@ def test_respond_non_stream_also_writes_token_counts_to_trace(cx, fake_llm, tmp_
     record = events.explain(tmp_path / "events.jsonl", reply.trace_id)
     assert "prompt_tokens" in record
     assert record["total_tokens"] == fake_llm.last_usage.total_tokens
+
+
+def test_closing_trace_event_records_provider_for_budget_filtering(cx, fake_llm, tmp_path):
+    """The closing trace event carries `provider` alongside `total_tokens` so
+    `sum_cloud_tokens_since` can filter ollama vs cloud without joining lines."""
+    reply = agent.respond("any", "turn1", cx)
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    closing = [
+        r for r in records
+        if r.get("id") == reply.trace_id and "total_tokens" in r
+    ]
+    assert len(closing) == 1
+    assert closing[0]["provider"] == fake_llm.config.provider
