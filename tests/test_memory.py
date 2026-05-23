@@ -71,6 +71,19 @@ def test_recall_finds_an_exact_match_and_is_stable(cx, fake_llm):
     assert [s.id for s in first] == [s.id for s in second]  # stable ordering
 
 
+def test_recall_can_exclude_specific_slice_ids(cx, fake_llm):
+    """Used by the agent to keep the just-ingested user message out of its
+    own retrieved context — otherwise the LLM sees a self-repeat."""
+    sid_a = ingest.save_user_message("the sky is blue", "turn1", cx)
+    ingest.save_user_message("a separate unrelated sentence", "turn1", cx)
+
+    without = retrieve.recall("the sky is blue", cx)
+    with_exclude = retrieve.recall("the sky is blue", cx, exclude={sid_a})
+
+    assert sid_a in {s.id for s in without}
+    assert sid_a not in {s.id for s in with_exclude}
+
+
 def test_forget_cascades_and_requires_consent(cx, fake_llm):
     fake_llm.concept_json = (
         '{"nodes": [{"name": "X", "kind": "concept"},'

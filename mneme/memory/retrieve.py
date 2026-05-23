@@ -38,8 +38,21 @@ class _GraphDB:
         return SimpleNamespace(all=lambda: rows)
 
 
-def recall(query: str, cx: sqlite3.Connection, k: int = 10, hops: int = 2) -> list[Slice]:
-    """Retrieve slices relevant to `query` via vector search + graph expansion."""
+def recall(
+    query: str,
+    cx: sqlite3.Connection,
+    k: int = 10,
+    hops: int = 2,
+    exclude: set[str] | None = None,
+) -> list[Slice]:
+    """Retrieve slices relevant to `query` via vector search + graph expansion.
+
+    `exclude` lets the caller drop specific slice ids — used by the agent to
+    keep the just-ingested user message out of its own retrieved context
+    (otherwise the LLM sees "you said X" right after the user said X, and
+    treats the turn as a repeat).
+    """
+    exclude = exclude or set()
     qvec = embed(query, cx)
 
     vec_rows = cx.execute(
@@ -79,6 +92,8 @@ def recall(query: str, cx: sqlite3.Connection, k: int = 10, hops: int = 2) -> li
     result: list[Slice] = []
     budget = _CHAR_BUDGET
     for _, sid in scored:
+        if sid in exclude:
+            continue
         row = cx.execute(
             "SELECT id, role, text, created_at FROM slices WHERE id = ?", (sid,)
         ).fetchone()

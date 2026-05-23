@@ -60,8 +60,10 @@ def build_prompt(user_text: str, slices: list, blueprint: str) -> tuple[str, str
 
 def respond(user_text: str, turn_id: str, cx: sqlite3.Connection) -> Reply:
     """Run one full chat turn."""
-    ingest.save_user_message(user_text, turn_id, cx)
-    slices = retrieve.recall(user_text, cx)
+    user_sid = ingest.save_user_message(user_text, turn_id, cx)
+    # Exclude the just-ingested user slice from its own retrieval; otherwise
+    # vector search returns it first and the LLM thinks the user is repeating.
+    slices = retrieve.recall(user_text, cx, exclude={user_sid})
     prefix, suffix = build_prompt(user_text, slices, soul.load_blueprint())
 
     trace_id = ulid()
