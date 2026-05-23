@@ -105,3 +105,23 @@ User msg
 - 默认 LLM：本地 Ollama；云 provider 走 opt-in
 
 不用 ORM、不用 networkx、不用专门图/向量数据库。理由见 `PRINCIPLES.md` 原则 3。
+
+---
+
+## 云 provider opt-in（PRINCIPLES.md 原则 4）
+
+默认走本地 Ollama。要接 OpenAI 兼容的云 API（DeepSeek / Zhipu / OpenAI / Moonshot
+/ OpenRouter 等），用环境变量覆盖默认：
+
+```sh
+export MNEME_PROVIDER=openai
+export MNEME_BASE_URL=https://api.deepseek.com
+export MNEME_API_KEY=sk-...
+export MNEME_CHAT_MODEL=deepseek-chat
+# DeepSeek 不提供 embeddings → 本地 hash 兜底（仅支持精确文本召回，无语义聚类）
+export MNEME_EMBED_VIA=hash
+mneme init && mneme chat
+```
+
+所有 cloud 调用都会在 `~/.mneme/events.jsonl` 先写一条 `audit` 事件（provider /
+endpoint / model / 估算 token），API key 本身**不会**被记录。

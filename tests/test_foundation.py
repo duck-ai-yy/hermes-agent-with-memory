@@ -52,6 +52,19 @@ def test_events_append_and_explain_merge(tmp_path):
         events.explain(log, "missing")
 
 
+def test_hash_embed_is_deterministic_and_distinguishing():
+    """`embed_via=hash` is the no-cloud-embeddings fallback (e.g. DeepSeek).
+
+    Same text -> same 768-float blob; different text -> different blob.
+    """
+    from mneme.llm.client import LLMClient, LLMConfig
+
+    client = LLMClient(LLMConfig(embed_via="hash"))
+    a, b, c = client.embed("hello"), client.embed("hello"), client.embed("world")
+    assert a == b and a != c
+    assert len(a) == 768 * 4  # float32 = 4 bytes
+
+
 def test_graph_bfs_respects_hop_limit(cx):
     now = 0
     for nid in ("a", "b", "c", "d"):

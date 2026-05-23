@@ -6,7 +6,9 @@ is opt-in and, when used, must emit an audit event before the call.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import random
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +27,10 @@ class LLMConfig:
     embed_model: str = "nomic-embed-text"
     api_key: str | None = None          # required only for cloud providers
     events_path: Path | None = None     # where audit events are written
+    embed_via: str = "provider"         # "provider" | "hash" — hash = local stdlib
+                                        # fallback for providers without embeddings
+                                        # (e.g. DeepSeek); degrades recall to
+                                        # exact-text matches only.
 
 
 _INSTANCE: "LLMClient | None" = None
@@ -89,6 +95,10 @@ class LLMClient:
 
     def embed(self, text: str) -> bytes:
         """Raw embedding call (no cache — caching lives in memory/embed.py)."""
+        if self.config.embed_via == "hash":
+            # Deterministic local fallback for providers without embeddings.
+            rng = random.Random(hashlib.sha256(text.encode()).digest())
+            return _pack([rng.random() for _ in range(768)])
         self._audit("embed", len(text))
         body = {"model": self.config.embed_model, "input": text}
         if self.config.provider == "ollama":

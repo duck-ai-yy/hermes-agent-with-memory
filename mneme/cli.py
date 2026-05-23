@@ -25,9 +25,20 @@ from .trace import events
 app = typer.Typer(add_completion=False, help="Local-first chat agent with memory.")
 
 
+_ENV_FIELDS = {
+    "MNEME_PROVIDER": "provider",
+    "MNEME_BASE_URL": "base_url",
+    "MNEME_CHAT_MODEL": "chat_model",
+    "MNEME_EMBED_MODEL": "embed_model",
+    "MNEME_API_KEY": "api_key",
+    "MNEME_EMBED_VIA": "embed_via",
+}
+
+
 def _configure_llm() -> None:
-    """Build the singleton LLM client with the audit log wired in."""
-    configure(LLMConfig(events_path=paths.EVENTS_PATH))
+    """Build the singleton LLM client; env vars override Ollama defaults."""
+    overrides = {f: v for env, f in _ENV_FIELDS.items() if (v := os.environ.get(env))}
+    configure(LLMConfig(events_path=paths.EVENTS_PATH, **overrides))
 
 
 def _open_db():
