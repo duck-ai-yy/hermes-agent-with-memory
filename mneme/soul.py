@@ -9,6 +9,7 @@ This module only *loads* — it never mutates identity.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 
 import yaml
@@ -16,8 +17,13 @@ import yaml
 from . import paths
 
 
+@functools.cache
 def load_prompt(name: str) -> dict:
-    """Load and parse `prompts/{name}.yaml`."""
+    """Load and parse `prompts/{name}.yaml`.
+
+    Cached because prompts are immutable within a process (no hot-reload per
+    PRINCIPLE 2: stable prefix preserves cache hits).
+    """
     return yaml.safe_load((paths.PROMPTS_DIR / f"{name}.yaml").read_text(encoding="utf-8"))
 
 

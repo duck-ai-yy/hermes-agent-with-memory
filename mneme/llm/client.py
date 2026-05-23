@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Iterator
 
@@ -27,10 +26,26 @@ class LLMConfig:
     events_path: Path | None = None     # where audit events are written
 
 
-@lru_cache(maxsize=1)
-def get_client(config: LLMConfig | None = None) -> "LLMClient":
-    """Process-wide singleton."""
-    return LLMClient(config or LLMConfig())
+# Process-wide singleton. `configure()` sets it once at startup (CLI / server);
+# `get_client()` lazily falls back to defaults so library callers never crash.
+# An explicit global beats `lru_cache(get_client)` because the latter keys on
+# args — a configured call followed by a no-arg call would build a *second*
+# client, silently losing the events_path wired in for cloud audit.
+_INSTANCE: "LLMClient | None" = None
+
+
+def configure(config: LLMConfig) -> None:
+    """Install the process-wide LLM client. Last call wins."""
+    global _INSTANCE
+    _INSTANCE = LLMClient(config)
+
+
+def get_client() -> "LLMClient":
+    """Return the singleton, lazily creating a default if not configured."""
+    global _INSTANCE
+    if _INSTANCE is None:
+        _INSTANCE = LLMClient(LLMConfig())
+    return _INSTANCE
 
 
 def _pack(vector: list[float]) -> bytes:
