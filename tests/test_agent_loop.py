@@ -1112,3 +1112,291 @@ def test_R_Agt_7_iter_cap_still_works_after_v09_rewire(
     ]
     reply = agent.respond("cap", "turn1", cx, confirm_cb=_accept)
     assert "max iteration cap (2)" in reply.text
+
+
+# ============================================================================
+# v0.10 / session_id field on agent-loop events (§B + §R)
+# ============================================================================
+#
+# These pin "every event the agent loop emits carries session_id". B2 / B5
+# / B6 are extended from happy-path to also assert session_id on the
+# tool_audit + tool_result events that ride along.
+#
+# B5 is split (lead must-fix #2) into 5 sub-tests, one per audit call site:
+#   B5a: audit_pending      (always, before confirm)
+#   B5b: audit_accepted     (confirm returns True)
+#   B5c: audit_rejected_not_approved (confirm returns False)
+#   B5d: audit_rejected_by_confirm_exception (confirm raises)
+#   B5e: tool_result event  (after registry.execute)
+# Each call site must carry session_id == the agent-supplied value.
+
+
+def test_B2_v10_one_tool_call_audit_and_result_events_carry_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """B2 (v0.10 extension): the canonical happy-path tool round-trip MUST
+    have session_id on every emitted event (audit pending, audit accepted,
+    tool_result)."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "I'll run that.", "tool_calls": [_shell_call("c1", "echo hi")],
+         "stop_reason": "tool_use"},
+        {"text": "final", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("do it", "turn1", cx, confirm_cb=_accept,
+                  session_id="SESS_B2")
+    ev = _events(tmp_path / "events.jsonl")
+    # Every tool_audit + tool_result event must carry session_id == SESS_B2.
+    for e in ev:
+        if e.get("kind") in ("tool_audit", "tool_result"):
+            assert e.get("session_id") == "SESS_B2", (
+                f"event missing/wrong session_id: {e}"
+            )
+
+
+def test_B5a_audit_pending_event_carries_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """B5a: the FIRST event written by _run_tool_call is tool_audit with
+    decision='pending' (before confirm). It must carry session_id."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("p", "turn1", cx, confirm_cb=_accept, session_id="SESS_5A")
+    ev = _events(tmp_path / "events.jsonl")
+    pending = [e for e in ev if e.get("kind") == "tool_audit"
+               and e.get("decision") == "pending"]
+    assert len(pending) == 1
+    assert pending[0]["session_id"] == "SESS_5A"
+
+
+def test_B5b_audit_accepted_event_carries_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """B5b: tool_audit with decision='accepted' (confirm returned True)."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("a", "turn1", cx, confirm_cb=_accept, session_id="SESS_5B")
+    ev = _events(tmp_path / "events.jsonl")
+    accepted = [e for e in ev if e.get("kind") == "tool_audit"
+                and e.get("decision") == "accepted"]
+    assert len(accepted) == 1
+    assert accepted[0]["session_id"] == "SESS_5B"
+
+
+def test_B5c_audit_rejected_not_approved_event_carries_session_id(
+    cx, fake_llm, tmp_path,
+):
+    """B5c: tool_audit with decision='rejected' from confirm returning
+    False (the user said no). Distinct from B5d (confirm raised)."""
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "rm -rf /")],
+         "stop_reason": "tool_use"},
+    ]
+    agent.respond("r", "turn1", cx, confirm_cb=_reject, session_id="SESS_5C")
+    ev = _events(tmp_path / "events.jsonl")
+    rej = [e for e in ev if e.get("kind") == "tool_audit"
+           and e.get("decision") == "rejected"
+           and "reason" not in e]  # B5c: no exception reason
+    assert len(rej) == 1
+    assert rej[0]["session_id"] == "SESS_5C"
+
+
+def test_B5d_audit_rejected_by_confirm_exception_event_carries_session_id(
+    cx, fake_llm, tmp_path,
+):
+    """B5d: tool_audit with decision='rejected' AND a `reason` field naming
+    the exception type (confirm_cb itself raised). This is the OTHER reject
+    path in agent.py:226 — easy to miss in audit_session_id coverage."""
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+    ]
+
+    def boom(name, args):  # noqa: ARG001
+        raise RuntimeError("confirm_cb itself failed")
+
+    agent.respond("d", "turn1", cx, confirm_cb=boom, session_id="SESS_5D")
+    ev = _events(tmp_path / "events.jsonl")
+    rej = [e for e in ev if e.get("kind") == "tool_audit"
+           and e.get("decision") == "rejected"
+           and e.get("reason", "").startswith("confirm_cb ")]
+    assert len(rej) == 1
+    assert rej[0]["session_id"] == "SESS_5D"
+
+
+def test_B5e_tool_result_event_carries_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """B5e: tool_result (post-execute) must carry session_id. This is the
+    audit row that records what the tool actually did."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("e", "turn1", cx, confirm_cb=_accept, session_id="SESS_5E")
+    ev = _events(tmp_path / "events.jsonl")
+    res = [e for e in ev if e.get("kind") == "tool_result"]
+    assert len(res) == 1
+    assert res[0]["session_id"] == "SESS_5E"
+
+
+def test_B6_v10_error_path_tool_events_carry_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """B6 (v0.10 extension): when the shell exits non-zero, both tool_audit
+    (accepted) and tool_result (with exit_code=2) must still carry
+    session_id. Error paths often regress silently."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellFail(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "trying", "tool_calls": [_shell_call("c1", "false")],
+         "stop_reason": "tool_use"},
+        {"text": "noted", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("bad", "turn1", cx, confirm_cb=_accept,
+                  session_id="SESS_B6")
+    ev = _events(tmp_path / "events.jsonl")
+    tool_evs = [e for e in ev
+                if e.get("kind") in ("tool_audit", "tool_result")]
+    assert tool_evs
+    for e in tool_evs:
+        assert e["session_id"] == "SESS_B6", e
+
+
+# -- R-6: cross-provider — all three provider shapes carry session_id -------
+
+
+def test_R_6_session_id_event_field_cross_provider_openai(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """R-6 (lead strengthened): the session_id audit-event invariant holds
+    for every provider, not just one. Set provider='openai' and re-pin."""
+    fake_llm.config.provider = "openai"
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("openai", "turn1", cx, confirm_cb=_accept,
+                  session_id="SESS_OPENAI")
+    ev = _events(tmp_path / "events.jsonl")
+    for e in ev:
+        if e.get("kind") in ("tool_audit", "tool_result", "trace"):
+            assert e.get("session_id") == "SESS_OPENAI", e
+
+
+def test_R_6_session_id_event_field_cross_provider_anthropic(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """R-6 (cont.): same invariant for anthropic. Different
+    _append_assistant_and_tool_result branch — pin it doesn't drop session_id."""
+    fake_llm.config.provider = "anthropic"
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("anth", "turn1", cx, confirm_cb=_accept,
+                  session_id="SESS_ANTHROPIC")
+    ev = _events(tmp_path / "events.jsonl")
+    for e in ev:
+        if e.get("kind") in ("tool_audit", "tool_result", "trace"):
+            assert e.get("session_id") == "SESS_ANTHROPIC", e
+
+
+def test_R_6_session_id_event_field_cross_provider_ollama(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """R-6 (cont.): default provider is 'ollama' — pin the same invariant
+    holds end-to-end on the default path too."""
+    # ollama is the default.
+    assert fake_llm.config.provider == "ollama"
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("oll", "turn1", cx, confirm_cb=_accept,
+                  session_id="SESS_OLLAMA")
+    ev = _events(tmp_path / "events.jsonl")
+    for e in ev:
+        if e.get("kind") in ("tool_audit", "tool_result", "trace"):
+            assert e.get("session_id") == "SESS_OLLAMA", e
+
+
+# -- R-18: respond_stream agent-loop path keeps session_id end-to-end -------
+
+
+def test_R_18_respond_stream_with_tools_propagates_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """R-18: respond_stream's tool-enabled branch (confirm_cb set) drives
+    the same _agent_loop as respond(). Pin that session_id reaches every
+    event emitted along the streaming path, including tool_result."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "streamed final", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    chunks = list(agent.respond_stream(
+        "stream", "turn1", cx, confirm_cb=_accept, session_id="SESS_STREAM",
+    ))
+    assert "".join(chunks) == "streamed final"
+    ev = _events(tmp_path / "events.jsonl")
+    for e in ev:
+        if e.get("kind") in ("tool_audit", "tool_result", "trace", "ingest"):
+            assert e.get("session_id") == "SESS_STREAM", e
+
+
+def test_R_18_respond_stream_no_confirm_cb_still_propagates_session_id(
+    cx, fake_llm, tmp_path,
+):
+    """R-18 (v0.7 streaming branch): respond_stream with confirm_cb=None
+    uses the no-agent-loop, pure-stream code path. Pin that this branch
+    also writes session_id to every trace + ingest event."""
+    list(agent.respond_stream("nostream", "turn1", cx,
+                              session_id="SESS_NOCONFIRM"))
+    ev = _events(tmp_path / "events.jsonl")
+    for e in ev:
+        if e.get("kind") in ("trace", "ingest"):
+            assert e.get("session_id") == "SESS_NOCONFIRM", e
