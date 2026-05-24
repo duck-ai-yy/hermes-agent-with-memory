@@ -1,6 +1,11 @@
 """Shared fixtures. The sandbox has no Ollama, so LLM calls use a deterministic
 fake: `embed` is a seeded RNG (same text -> same vector), `chat` returns canned
 concept JSON or a canned reply depending on the system prompt.
+
+v0.8: `chat()` also handles a `tools` kwarg. When tools are passed, the fake
+returns an `AssistantMessage` driven by `tool_call_script` (a list of canned
+turn outputs popped one per call). The default script ends the turn cleanly
+so older tests that didn't set the script still get sane behavior.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mneme.llm.client import AssistantMessage
 from mneme.memory import store
 
 
@@ -24,10 +30,38 @@ class FakeLLM:
         self.embed_calls = 0
         self.chat_calls = 0
         self.last_usage: SimpleNamespace | None = None
+        # Agent-loop scripting (v0.8). Each list entry describes one chat()
+        # invocation **when tools are passed**. An entry is either:
+        #   - an AssistantMessage instance, or
+        #   - a dict {"text": str, "tool_calls": [ToolCall...],
+        #             "stop_reason": str}
+        # When the script is exhausted, fake returns an end_turn message with
+        # self.reply — so the loop terminates and stale scripts can't hang
+        # the test runner.
+        self.tool_call_script: list = []
 
-    def chat(self, messages: list[dict], *, stream: bool = True):
+    def chat(self, messages: list[dict], *, stream: bool = True, tools=None):
         self.chat_calls += 1
         self.last_usage = None
+        if tools:
+            # Tool-using path: respect the script; default to a clean end_turn.
+            entry = self.tool_call_script.pop(0) if self.tool_call_script else None
+            if entry is None:
+                msg = AssistantMessage(
+                    text=self.reply, tool_calls=[], stop_reason="end_turn",
+                )
+            elif isinstance(entry, AssistantMessage):
+                msg = entry
+            else:
+                msg = AssistantMessage(
+                    text=entry.get("text", ""),
+                    tool_calls=entry.get("tool_calls", []),
+                    stop_reason=entry.get("stop_reason", "end_turn"),
+                )
+            # Token usage is reported even when the model called a tool — the
+            # agent loop accumulates across iterations for the close-trace.
+            self.last_usage = self._fake_usage(msg.text or "tool")
+            return msg
         system = messages[0]["content"]
         text = self.concept_json if "STRICT JSON" in system else self.reply
         if not stream:
