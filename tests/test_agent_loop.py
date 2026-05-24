@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import json
 
-import pytest
 
 from mneme import agent
-from mneme.llm.client import AssistantMessage, ToolCall
+from mneme.llm.client import ToolCall
 
 
 # -- helpers -----------------------------------------------------------------
