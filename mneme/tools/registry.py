@@ -256,15 +256,19 @@ def schemas_for_provider(
             "description": t.schema["description"],
             "input_schema": t.schema["input_schema"],
         } for t in selected]
-    # OpenAI / Ollama function shape
-    return [{
-        "type": "function",
-        "function": {
-            "name": t.schema["name"],
-            "description": t.schema["description"],
-            "parameters": t.schema["input_schema"],
-        },
-    } for t in selected]
+    if provider in ("openai", "ollama"):
+        return [{
+            "type": "function",
+            "function": {
+                "name": t.schema["name"],
+                "description": t.schema["description"],
+                "parameters": t.schema["input_schema"],
+            },
+        } for t in selected]
+    raise ValueError(
+        f"schemas_for_provider: unknown provider {provider!r}; "
+        f"expected one of: anthropic, openai, ollama"
+    )
 
 
 def execute(name: str, args: dict) -> ToolResult:
@@ -302,7 +306,7 @@ def execute(name: str, args: dict) -> ToolResult:
                               audit={"error": "ArgumentError"})
         expected = schema_props[pname]["type"]
         if not _value_matches(value, expected):
-            actual = type(value).__name__
+            actual = _json_type_of(value)
             msg = (f"ArgumentError: tool {name!r} parameter {pname!r} "
                    f"must be {expected}, got {actual}")
             return ToolResult(content=msg, is_error=True,
@@ -327,6 +331,28 @@ _JSON_TYPE_PY = {
     "array": list,
     "object": dict,
 }
+
+
+def _json_type_of(value: Any) -> str:
+    """Python value -> JSON-schema type name. The error message uses this so
+    the LLM sees the same vocabulary as the schema (`string`/`object` etc.),
+    not Python repr (`str`/`dict`). See docs/lessons/architect.md v0.8 lesson
+    on pinning user-visible literals."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if value is None:
+        return "null"
+    return type(value).__name__
 
 
 def _value_matches(value: Any, json_type: str) -> bool:
