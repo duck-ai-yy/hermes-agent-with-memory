@@ -261,7 +261,12 @@ def search(
     width: int = 100,
     full: bool = False,
 ) -> None:
-    """Vector + graph search over long-term memory. Read-only, no LLM."""
+    """Vector + graph search over long-term memory.
+
+    Read-only: never writes slices, vec_slices, or events. May write to
+    embeddings_cache for a novel query — that is the v0.3 cache contract,
+    not a v0.6 side effect.
+    """
     if not query.strip():
         typer.echo("empty query")
         return

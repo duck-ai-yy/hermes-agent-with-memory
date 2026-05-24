@@ -95,12 +95,22 @@ def test_format_hit_renders_score_to_three_decimals():
 def test_search_returns_hits_with_header_and_footer(runner, home_db, fake_llm):
     ingest.save_user_message("the capital of memory is recall", "turn1", home_db)
     home_db.commit()
+    # Snapshot AFTER ingest (which writes its own events) — we want to assert
+    # that the search call itself adds nothing.
+    fake_llm.chat_calls = 0
+    events_before = paths.EVENTS_PATH.read_bytes() if paths.EVENTS_PATH.exists() else b""
 
     result = runner.invoke(cli.app, ["search", "the capital of memory is recall"])
     assert result.exit_code == 0
     assert "score" in result.stdout  # header
     assert "the capital of memory is recall" in result.stdout
     assert "hits" in result.stdout    # footer summary line
+    # search is read-only: no LLM chat, no events appended (vs. its baseline).
+    # Guards the spec'd "纯 read, no LLM, no events" contract — a future
+    # "let's count usage" telemetry leak would fire this.
+    assert fake_llm.chat_calls == 0
+    events_after = paths.EVENTS_PATH.read_bytes() if paths.EVENTS_PATH.exists() else b""
+    assert events_after == events_before
 
 
 def test_search_on_empty_db_prints_no_hits_and_exits_zero(runner, home_db):
@@ -196,15 +206,42 @@ def test_search_k_huge_does_not_crash(runner, home_db, fake_llm):
     assert "only row" in result.stdout
 
 
+def test_search_negative_k_clamps_to_zero_returns_no_hits(runner, home_db, fake_llm):
+    """Locks in the current clamp semantics: `-k -1` becomes `-k 0` via
+    recall()'s `max(0, k)`. If you change to BadParameter, this test fails
+    on purpose so the new policy gets documented."""
+    ingest.save_user_message("seeded", "turn1", home_db)
+    home_db.commit()
+    result = runner.invoke(cli.app, ["search", "seeded", "-k", "-1"])
+    assert result.exit_code == 0
+    assert "no hits" in result.stdout
+
+
+def test_search_negative_hops_falls_through_to_vector_only(runner, home_db, fake_llm):
+    """`--hops -1` makes graph.bfs a no-op (its for-loop never iterates),
+    so the result is whatever vector search alone returns. Locked in here
+    because the test lead flagged this as undocumented behavior."""
+    ingest.save_user_message("seeded", "turn1", home_db)
+    home_db.commit()
+    result = runner.invoke(cli.app, ["search", "seeded", "--hops", "-1"])
+    assert result.exit_code == 0
+    # Vector search returns the row regardless of graph hops.
+    assert "seeded" in result.stdout
+
+
 # ---------- search command: special characters & determinism -----------------
 
 def test_search_handles_special_characters_in_query(runner, home_db, fake_llm):
-    """Quotes, SQL meta-chars, unicode — must not break parsing or SQL."""
+    """Quotes, SQL meta-chars, unicode — must not break parsing or SQL, AND
+    the matching slice text must actually appear in stdout (a query silently
+    swallowed by mis-escaping would still pass an exit-code-only assertion)."""
     ingest.save_user_message("Tauri's API; SELECT * FROM 你好", "turn1", home_db)
     home_db.commit()
     weird = "Tauri's API; SELECT * FROM 你好"
     result = runner.invoke(cli.app, ["search", weird])
     assert result.exit_code == 0
+    assert weird in result.stdout
+    assert 'query="' + weird + '"' in result.stdout  # footer echoes it back
 
 
 def test_search_same_query_twice_is_byte_identical(runner, home_db, fake_llm):
