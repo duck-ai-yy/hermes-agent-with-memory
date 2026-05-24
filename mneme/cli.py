@@ -20,6 +20,7 @@ from . import paths
 from .agent import respond_stream
 from .ids import ulid
 from .llm import client as _llm
+from .llm import pricing
 from .llm.client import BudgetExceeded, LLMConfig, configure
 from .memory import forget as forget_mod
 from .memory import retrieve, store

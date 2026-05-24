@@ -15,6 +15,7 @@ from typing import Iterator
 from . import soul
 from .ids import ulid
 from .llm import client as _llm
+from .llm import pricing
 from .memory import ingest, retrieve, store
 from .trace import events
 
@@ -95,6 +96,17 @@ def _close_turn(reply_text, slices, trace_id, client, ep, turn_id, cx) -> Reply:
                 "completion_tokens": usage.completion_tokens,
                 "total_tokens": usage.total_tokens,
             }
+            # Pricing is best-effort: a broken table must not break trace
+            # writing (principle 5). Omit cost_usd on None so historical
+            # sums in `stats` don't get polluted with zeros for unknown models.
+            try:
+                cost = pricing.cost_usd(
+                    client.config.provider, client.config.chat_model, usage
+                )
+            except Exception:
+                cost = None
+            if cost is not None:
+                extra["cost_usd"] = cost
         events.append(ep, kind="trace", id=trace_id,
                       response_hash=soul.prompt_hash(reply_text),
                       citation_quality=citation_quality,
