@@ -1,6 +1,13 @@
 """Tools the agent can call.
 
-M1 ships one tool — `shell` — wired into the agent loop directly. v0.9 / M2
-will introduce a `@tool` decorator and registry; until then we keep this
-package deliberately bare (PRINCIPLES.md principle 1).
+v0.9 / M2: each tool module registers itself with `registry` via the
+`@tool` decorator at import time. Importing this package guarantees all
+ships-with-mneme tools are loaded; the agent loop talks only to
+`registry.execute` / `registry.schemas_for_provider`.
 """
+
+# Importing the modules triggers their @tool decorators.
+from . import shell  # noqa: F401
+from . import file_read  # noqa: F401
+from . import web_fetch  # noqa: F401
+from . import python_exec  # noqa: F401

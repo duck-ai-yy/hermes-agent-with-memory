@@ -1,10 +1,11 @@
 """The `shell` tool — execute a shell command, return stdout/stderr/exit code.
 
-M1 scope: hardcoded single tool. No registry, no policy layer, no command
-filtering (that's M2's tool-registry policy layer; PRINCIPLES.md principle 1
-says don't build it until we have it). Confirmation and audit are layered
-on top by `mneme/agent.py`, NOT here — this module is pure execution so it
-remains trivially testable in isolation.
+v0.9 / M2: the SCHEMA literal is gone — the registry derives the schema
+from the @tool-decorated `shell(command)` wrapper below. The lower-level
+`execute()` / `format_for_llm()` stay byte-identical to v0.8 (signatures,
+return types, error labels, byte caps — `tests/test_shell_tool.py` is
+unchanged). Confirmation and audit are still layered on top by
+`mneme/agent.py`, NOT here — this module remains pure execution.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import dataclass
+
+from .registry import ToolResult, tool
 
 # When the LLM sees stdout it sees at most this many bytes; beyond that we
 # slice and set `truncated=True`. Lets the model read small files inline
@@ -24,30 +27,6 @@ STDERR_LIMIT = 4 * 1024
 # should never be invoked through this tool; if they are, the timeout fires
 # and we report it cleanly rather than hang the agent loop.
 DEFAULT_TIMEOUT = 30.0
-
-# Tool schema the agent declares to the LLM. The shape is provider-agnostic
-# at this layer: the agent layer wraps it for Anthropic vs OpenAI/Ollama
-# (see docs/knowledge/provider-tool-calling.md §1).
-SCHEMA: dict = {
-    "name": "shell",
-    "description": (
-        "Execute a shell command on the user's local machine. Returns stdout, "
-        "stderr, and the exit code. Use for reading files, listing directories, "
-        "or any non-destructive inspection. Every call requires user "
-        "confirmation, so prefer one well-formed command over many."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The shell command to execute (passed to /bin/sh -c).",
-            },
-        },
-        "required": ["command"],
-    },
-}
-
 
 @dataclass(frozen=True)
 class ShellResult:
@@ -137,6 +116,43 @@ def format_for_llm(result: ShellResult) -> str:
             if err_truncated else ""
         parts.append(f"stderr:\n{err}{suffix}")
     return "\n\n".join(parts)
+
+
+# -- @tool wrapper: registers `shell` in the registry ---------------------
+
+
+@tool
+def shell(command: str) -> ToolResult:
+    """Execute a shell command on the user's local machine. Returns stdout, stderr, and the exit code. Use for reading files, listing directories, or any non-destructive inspection. Every call requires user confirmation, so prefer one well-formed command over many.
+
+    Args:
+        command: The shell command to execute (passed to /bin/sh -c).
+    """  # noqa: E501
+    # `execute` is documented as "never raises" but the v0.8 agent.py wrapped
+    # it in try/except to preserve a "ShellError: <Type>: <msg>" prefix
+    # against test-time monkeypatching. Keep that exact contract here so
+    # the registry's generic catch-all never sees a shell error first.
+    try:
+        result = execute(command)
+    except Exception as exc:
+        msg = f"ShellError: {type(exc).__name__}: {exc}"
+        return ToolResult(
+            content=msg,
+            is_error=True,
+            audit={"error": type(exc).__name__, "exit_code": None},
+        )
+    content = format_for_llm(result)
+    return ToolResult(
+        content=content,
+        is_error=result.exit_code != 0,
+        audit={
+            "exit_code": result.exit_code,
+            "stdout_bytes": result.stdout_bytes,
+            "stderr_bytes": result.stderr_bytes,
+            "truncated": result.truncated,
+            "duration_ms": result.duration_ms,
+        },
+    )
 
 
 def _build_result(

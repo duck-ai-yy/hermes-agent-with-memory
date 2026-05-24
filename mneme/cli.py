@@ -241,6 +241,9 @@ def _stream_to_stdout(user_text: str, turn_id: str, cx):
         user_text, turn_id, cx,
         confirm_cb=_cli_confirm_tool,
         on_intermediate_text=_print_intermediate,
+        # CLI exposes every registered tool — None lets the registry
+        # decide (v0.9 ships shell / file_read / web_fetch / python_exec).
+        allowed_tools=None,
     )
     reply = None
     while True:

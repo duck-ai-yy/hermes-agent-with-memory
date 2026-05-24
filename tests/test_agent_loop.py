@@ -694,3 +694,421 @@ class _ShellFail:
         self.stderr_bytes = 5
         self.truncated = False
         self.duration_ms = 1
+
+
+# ============================================================================
+# v0.9 / M2 integration tests — registry rewire + allowed_tools filter
+# ============================================================================
+#
+# These tests pin the agent.py refactor that replaced v0.8's hardcoded
+# `shell.SCHEMA` + dispatch with `tool_registry.schemas_for_provider` and
+# `tool_registry.execute`. The contract:
+#
+#   - confirm_cb=None -> tools=None on the wire (v0.7 behavior preserved)
+#   - confirm_cb set, allowed_tools=None -> ALL registered tools' schemas
+#   - allowed_tools=[]  -> tools=None on the wire (no-tools fallback)
+#   - allowed_tools=[names] -> exactly that subset's schemas, in caller order
+
+
+def _agent_messages_seen(fake):
+    """The messages list the FAKE saw on each agent-loop chat() call."""
+    idx = _agent_chat_indices(fake)
+    return [fake.messages_seen[i] for i in idx]
+
+
+def test_D1_registry_schemas_passed_to_llm_when_tools_enabled(cx, fake_llm):
+    """D1: with confirm_cb set and no allowed_tools restriction, the LLM
+    receives every registered tool's schema (4 in v0.9: file_read,
+    python_exec, shell, web_fetch). Sorted alphabetical."""
+    fake_llm.tool_call_script = [
+        {"text": "no tools used", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("hi", "turn1", cx, confirm_cb=_accept)
+    tools = _agent_tools_seen(fake_llm)[0]
+    assert tools is not None
+    # Each schema is the Ollama/OpenAI shape (because FakeLLM defaults
+    # provider='ollama'); pull the names out.
+    names = [t["function"]["name"] for t in tools]
+    assert "shell" in names
+    assert "file_read" in names
+    assert "web_fetch" in names
+    assert "python_exec" in names
+    assert names == sorted(names)
+
+
+def test_D2_allowed_tools_subset_filters_schemas_in_order(cx, fake_llm):
+    """D2: allowed_tools=['file_read', 'shell'] -> exactly those two
+    schemas, in the order the caller passed."""
+    fake_llm.tool_call_script = [
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("hi", "turn1", cx, confirm_cb=_accept,
+                  allowed_tools=["file_read", "shell"])
+    tools = _agent_tools_seen(fake_llm)[0]
+    names = [t["function"]["name"] for t in tools]
+    assert names == ["file_read", "shell"]
+
+
+def test_D3_allowed_tools_empty_list_degrades_to_no_tools_path(cx, fake_llm):
+    """D3: allowed_tools=[] is the explicit 'no tools' sentinel. The agent
+    loop must NOT call the LLM with an empty tools[] payload (some providers
+    reject that). Instead, fall back to the v0.7 single-call no-tools path:
+    tools=None on the wire and the chat method is the legacy plain-text
+    branch (not the AssistantMessage branch)."""
+    fake_llm.tool_call_script = [
+        {"text": "would call tool",
+         "tool_calls": [ToolCall(id="t1", name="shell", arguments={"command": "ls"})],
+         "stop_reason": "tool_use"},
+    ]
+    reply = agent.respond("hi", "turn1", cx, confirm_cb=_accept,
+                          allowed_tools=[])
+    # Single agent-loop chat call, tools=None, no tool round-trip.
+    tools_seen = _agent_tools_seen(fake_llm)
+    assert tools_seen == [None]
+    # The model's scripted tool call was NEVER consumed (no AssistantMessage path).
+    assert len(fake_llm.tool_call_script) == 1
+    # The reply path was the plain-text branch, so reply.text == self.reply default.
+    assert reply.text == "noted"
+
+
+def test_D4_allowed_tools_unknown_name_silently_filtered_in_agent_path(
+    cx, fake_llm,
+):
+    """D4: orchestrator decision (R-Reg-X also pinned in registry tests).
+    allowed_tools=['nope', 'shell'] -> tools list contains only 'shell'.
+    Unknown names fall out silently. The agent loop is the caller of
+    `schemas_for_provider`, so this test pins end-to-end intent."""
+    fake_llm.tool_call_script = [
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("hi", "turn1", cx, confirm_cb=_accept,
+                  allowed_tools=["nope_does_not_exist", "shell"])
+    tools = _agent_tools_seen(fake_llm)[0]
+    names = [t["function"]["name"] for t in tools]
+    assert names == ["shell"]
+
+
+def test_D5_registry_dispatch_for_file_read_works_in_agent_loop(
+    cx, fake_llm, tmp_path,
+):
+    """D5: agent loop dispatches a `file_read` tool call via registry.execute,
+    not a hardcoded if-name=='shell' chain. Prove with a real file under
+    sandbox HOME (tmp_path-based file)."""
+    # Use the home directory because file_read's sandbox includes Path.home().
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False,
+                                     dir=tmp_path, encoding="utf-8") as fh:
+        fh.write("hello from disk")
+        path = fh.name
+
+    # tmp_path is under cwd... no, only if pytest happened to chdir there.
+    # Just make sure path is under tmp_path which is the CWD sandbox if we
+    # chdir. Actually `agent.respond` doesn't change cwd, so use the path
+    # directly; sandbox includes CWD = where pytest was run, which contains
+    # tmp_path. Either way: the file is created under tmp_path which equals
+    # the SQLite db dir, and tmp_path is under the actual cwd (pytest tmpdir).
+    # file_read sandbox: cwd is allowed -> tmp_path is allowed.
+
+    fake_llm.tool_call_script = [
+        {"text": "reading", "tool_calls": [
+            ToolCall(id="f1", name="file_read", arguments={"path": path}),
+        ], "stop_reason": "tool_use"},
+        {"text": "got it", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    reply = agent.respond("read it", "turn1", cx, confirm_cb=_accept)
+    assert reply.text == "got it"
+
+    # The tool_result on round 2 carries the file contents.
+    round2 = _agent_round(fake_llm, 2)
+    tool_msgs = [m for m in round2 if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["content"] == "hello from disk"
+
+
+def test_D6_registry_dispatch_for_python_exec_subprocess_call(
+    cx, fake_llm, monkeypatch,
+):
+    """D6: same as D5 but for python_exec. Use a monkeypatched
+    subprocess.run so we don't actually spawn python."""
+    from mneme.tools import python_exec as pe_mod
+
+    class _Done:
+        stdout = "hello-from-py\n"
+        stderr = ""
+        returncode = 0
+
+    monkeypatch.setattr(pe_mod.subprocess, "run", lambda *a, **kw: _Done())
+
+    fake_llm.tool_call_script = [
+        {"text": "running", "tool_calls": [
+            ToolCall(id="p1", name="python_exec",
+                     arguments={"code": "print('hello-from-py')"}),
+        ], "stop_reason": "tool_use"},
+        {"text": "done py", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    reply = agent.respond("run py", "turn1", cx, confirm_cb=_accept)
+    assert reply.text == "done py"
+    round2 = _agent_round(fake_llm, 2)
+    tool_msgs = [m for m in round2 if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert "exit_code: 0" in tool_msgs[0]["content"]
+    assert "stdout:\nhello-from-py" in tool_msgs[0]["content"]
+
+
+def test_D7_argument_error_with_json_schema_vocabulary_in_agent_path(
+    cx, fake_llm,
+):
+    """D7 reconciled: an LLM passing wrong types reaches the registry's
+    type validation. The tool_result fed back to the model must use
+    JSON-schema vocabulary ('got object', 'got integer', ...).
+    Lead must-fix #1: literal-substring assert."""
+    fake_llm.tool_call_script = [
+        {"text": "trying",
+         "tool_calls": [ToolCall(id="c1", name="shell",
+                                 arguments={"command": {"k": "v"}})],
+         "stop_reason": "tool_use"},
+        {"text": "noted error", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("bad type", "turn1", cx, confirm_cb=_accept)
+    round2 = _agent_round(fake_llm, 2)
+    tool_msgs = [m for m in round2 if m.get("role") == "tool"]
+    assert (
+        "ArgumentError: tool 'shell' parameter 'command' must be string, "
+        "got object"
+    ) in tool_msgs[0]["content"]
+
+
+def test_D8_provider_anthropic_gets_anthropic_shape_schemas(cx, fake_llm):
+    """D8: provider='anthropic' gets {name, description, input_schema}
+    schemas at top-level (not OpenAI's wrapped {type: function, function}).
+    """
+    fake_llm.config.provider = "anthropic"
+    fake_llm.tool_call_script = [
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("hi", "turn1", cx, confirm_cb=_accept,
+                  allowed_tools=["shell"])
+    tools = _agent_tools_seen(fake_llm)[0]
+    assert len(tools) == 1
+    # Anthropic shape: name + description + input_schema at top level.
+    assert set(tools[0].keys()) == {"name", "description", "input_schema"}
+
+
+def test_D9_tool_result_audit_event_carries_tool_specific_fields(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """D9: the registry returns ToolResult with `audit` dict; agent.py
+    merges those fields into the tool_result trace event. For shell:
+    audit includes exit_code, stdout_bytes, stderr_bytes, truncated,
+    duration_ms. The trace event must carry these as top-level fields."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("c1", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "ok", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("audit fields", "turn1", cx, confirm_cb=_accept)
+    ev = _events(tmp_path / "events.jsonl")
+    results = [e for e in ev if e.get("kind") == "tool_result"]
+    assert len(results) == 1
+    rec = results[0]
+    # Audit-derived fields are merged flat into the event.
+    assert rec["exit_code"] == 0
+    assert "stdout_bytes" in rec
+    assert "stderr_bytes" in rec
+    assert "duration_ms" in rec
+    assert rec["truncated"] is False
+
+
+def test_D10_unknown_tool_via_registry_returns_unknown_tool_block(
+    cx, fake_llm, tmp_path,
+):
+    """D10: same as B27 but pinned for v0.9 registry path: registry.execute
+    returns ToolResult(content='UnknownTool: ...', is_error=True). The
+    tool_result trace event includes error='UnknownTool' and exit_code=None."""
+    fake_llm.tool_call_script = [
+        {"text": "ghost",
+         "tool_calls": [ToolCall(id="x", name="ghost_tool_no_such",
+                                 arguments={})],
+         "stop_reason": "tool_use"},
+        {"text": "ok", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("ghost", "turn1", cx, confirm_cb=_accept)
+    round2 = _agent_round(fake_llm, 2)
+    tool_msgs = [m for m in round2 if m.get("role") == "tool"]
+    assert tool_msgs[0]["content"].startswith("UnknownTool:")
+    ev = _events(tmp_path / "events.jsonl")
+    results = [e for e in ev if e.get("kind") == "tool_result"]
+    assert results[0]["error"] == "UnknownTool"
+    assert results[0]["exit_code"] is None
+
+
+def test_D11_respond_stream_with_confirm_cb_uses_loop(cx, fake_llm):
+    """D11: respond_stream with confirm_cb set drives the agent loop and
+    yields the final reply as a single chunk (M1 spec).
+    """
+    fake_llm.tool_call_script = [
+        {"text": "final via stream",
+         "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    chunks = list(agent.respond_stream("hi", "turn1", cx, confirm_cb=_accept))
+    assert "".join(chunks) == "final via stream"
+
+
+def test_D12_respond_stream_allowed_tools_empty_falls_back_to_v07_stream(
+    cx, fake_llm,
+):
+    """D12: respond_stream with confirm_cb set BUT allowed_tools=[] —
+    the loop's use_tools guard short-circuits to no-tools; the no-tool
+    branch is the single-call path that yields plain text chunks."""
+    fake_llm.reply = "stream no tools"
+    chunks = list(agent.respond_stream(
+        "hi", "turn1", cx, confirm_cb=_accept, allowed_tools=[],
+    ))
+    # Joined yields == the canned reply.
+    assert "".join(chunks) == "stream no tools"
+
+
+# -- R-Agt-1..7: registry-aware ratchets ----------------------------------
+
+
+def test_R_Agt_1_no_hardcoded_shell_schema_import_in_agent(cx, fake_llm):
+    """R-Agt-1: the agent module must NOT import shell.SCHEMA (it was
+    deleted in v0.9 step 4). Just verify the attribute is gone."""
+    from mneme.tools import shell as shell_mod
+    assert not hasattr(shell_mod, "SCHEMA")
+
+
+def test_R_Agt_2_agent_uses_registry_module(cx, fake_llm):
+    """R-Agt-2: agent.py imports `tool_registry` and calls .execute() /
+    .schemas_for_provider(). Quick lint."""
+    from mneme import agent as agent_mod
+    src = open(agent_mod.__file__, encoding="utf-8").read()
+    assert "tool_registry.execute(" in src
+    assert "tool_registry.schemas_for_provider(" in src
+
+
+def test_R_Agt_3_close_trace_records_tool_call_id_consistently(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """R-Agt-3: tool_audit (pending + accepted) and tool_result events
+    must all carry the same tool_call_id for one call, so forensic
+    grep-by-id yields the full lifecycle."""
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [_shell_call("traceme", "echo")],
+         "stop_reason": "tool_use"},
+        {"text": "ok", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("audit chain", "turn1", cx, confirm_cb=_accept)
+    ev = _events(tmp_path / "events.jsonl")
+    ids = {
+        e.get("tool_call_id") for e in ev
+        if e.get("kind") in ("tool_audit", "tool_result")
+    }
+    assert ids == {"traceme"}
+
+
+def test_R_Agt_4_python_exec_via_registry_records_exit_code(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """R-Agt-4: python_exec's audit dict has 'exit_code', so the trace
+    event must carry exit_code (not None) on a successful run."""
+    from mneme.tools import python_exec as pe_mod
+
+    class _Done:
+        stdout = "x\n"
+        stderr = ""
+        returncode = 0
+    monkeypatch.setattr(pe_mod.subprocess, "run", lambda *a, **kw: _Done())
+
+    fake_llm.tool_call_script = [
+        {"text": "", "tool_calls": [
+            ToolCall(id="p1", name="python_exec", arguments={"code": "print('x')"})],
+         "stop_reason": "tool_use"},
+        {"text": "ok", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("pyex", "turn1", cx, confirm_cb=_accept)
+    ev = _events(tmp_path / "events.jsonl")
+    results = [e for e in ev if e.get("kind") == "tool_result"
+               and e.get("tool") == "python_exec"]
+    assert len(results) == 1
+    assert results[0]["exit_code"] == 0
+
+
+def test_R_Agt_5_web_fetch_via_registry_returns_body_to_llm(
+    cx, fake_llm, mock_httpx, mock_getaddrinfo,
+):
+    """R-Agt-5: web_fetch path works through the registry. The body
+    arrives in the round-2 tool_result content."""
+    mock_getaddrinfo.set("example.com", "93.184.216.34")
+
+    def handler(req):
+        import httpx as _hx
+        return _hx.Response(200, text="page body",
+                            headers={"content-type": "text/plain"})
+
+    mock_httpx.set_handler(handler)
+    fake_llm.tool_call_script = [
+        {"text": "fetching", "tool_calls": [
+            ToolCall(id="w1", name="web_fetch",
+                     arguments={"url": "http://example.com/"})],
+         "stop_reason": "tool_use"},
+        {"text": "got it", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("fetch it", "turn1", cx, confirm_cb=_accept)
+    round2 = _agent_round(fake_llm, 2)
+    tool_msgs = [m for m in round2 if m.get("role") == "tool"]
+    assert tool_msgs[0]["content"] == "page body"
+
+
+def test_R_Agt_6_argument_error_does_not_invoke_underlying_tool_fn(
+    cx, fake_llm, monkeypatch,
+):
+    """R-Agt-6: when registry rejects bad-type args, the @tool-decorated fn
+    body is never called. We monkeypatch shell.shell to count calls."""
+    from mneme.tools import shell as shell_mod
+    called = {"n": 0}
+
+    real_shell = shell_mod.shell
+
+    def counting_shell(*a, **kw):
+        called["n"] += 1
+        return real_shell(*a, **kw)
+
+    monkeypatch.setattr(shell_mod, "shell", counting_shell)
+    fake_llm.tool_call_script = [
+        {"text": "trying",
+         "tool_calls": [ToolCall(id="c1", name="shell",
+                                 arguments={"command": 42})],
+         "stop_reason": "tool_use"},
+        {"text": "noted error", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("int command", "turn1", cx, confirm_cb=_accept)
+    # The tool body should not have been invoked.
+    assert called["n"] == 0
+
+
+def test_R_Agt_7_iter_cap_still_works_after_v09_rewire(
+    cx, fake_llm, monkeypatch,
+):
+    """R-Agt-7: the v0.9 rewire must not break the iter cap (B19's
+    structural contract). Cap at 2, forever-tool-calling model, observe abort."""
+    monkeypatch.setenv("MNEME_MAX_ITERS", "2")
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: _ShellOK(cmd),
+    )
+    fake_llm.tool_call_script = [
+        {"text": f"r{i}", "tool_calls": [_shell_call(f"c{i}", "echo")],
+         "stop_reason": "tool_use"}
+        for i in range(5)
+    ]
+    reply = agent.respond("cap", "turn1", cx, confirm_cb=_accept)
+    assert "max iteration cap (2)" in reply.text
