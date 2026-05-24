@@ -10,9 +10,13 @@ CREATE TABLE IF NOT EXISTS slices (
     role        TEXT NOT NULL,               -- 'user' | 'assistant' | 'fact'
     text        TEXT NOT NULL,
     turn_id     TEXT,
+    session_id  TEXT,                        -- ULID, groups turns into a chat session (v0.10)
     created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_slices_turn ON slices(turn_id);
+-- idx_slices_session is created by store._migrate_slices_session_id so the
+-- same code path handles fresh DBs and pre-v0.10 DBs (where the column has
+-- to be ALTERed in before the index can reference it).
 
 -- Concepts: people, artifacts, ideas, time references. Deduplicated by name.
 CREATE TABLE IF NOT EXISTS nodes (
