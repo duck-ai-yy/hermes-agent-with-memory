@@ -107,11 +107,37 @@ def init() -> None:
 
 
 @app.command()
-def chat() -> None:
-    """Interactive REPL. Slash commands: /explain, /forget <id>, /quit."""
+def chat(
+    resume: str = typer.Option(
+        None, "--resume", help="Resume an existing session by its ULID.",
+    ),
+) -> None:
+    """Interactive REPL. Slash commands: /explain, /forget <id>, /quit.
+
+    v0.10: every `mneme chat` invocation lives in a session (a ULID that
+    groups its turns). Pass `--resume <id>` to continue an existing
+    session — the id must match a session already on disk; otherwise the
+    CLI exits with code 1.
+    """
     _configure_llm()
     cx = _open_db()
-    turn_id = ulid()
+    if resume is not None:
+        row = cx.execute(
+            "SELECT 1 FROM slices WHERE session_id = ? LIMIT 1", (resume,),
+        ).fetchone()
+        if row is None:
+            cx.close()
+            typer.secho(
+                f"SessionNotFound: no session '{resume}'", fg=typer.colors.RED,
+            )
+            raise typer.Exit(1)
+        session_id = resume
+    else:
+        session_id = ulid()
+    # Track whether we've already shown the full session id this run; the
+    # first turn echoes the full 26-char ULID, later turns shrink to an
+    # ellipsis + last 4 chars to keep the footer compact.
+    session_shown = False
     last_trace: str | None = None
     typer.echo("mneme chat — /quit to exit, /forget <id>, /explain [<id>]")
 
@@ -136,8 +162,12 @@ def chat() -> None:
                 typer.echo("nothing to explain yet")
             continue
 
+        # v0.10: a fresh turn_id per user input. Pre-v0.10 the REPL reused
+        # one turn_id for the whole process, conflating turn and session;
+        # the new session_id now plays that role.
+        turn_id = ulid()
         try:
-            reply = _stream_to_stdout(line, turn_id, cx)
+            reply = _stream_to_stdout(line, turn_id, cx, session_id=session_id)
         except BudgetExceeded as exc:
             typer.secho(f"\nbudget: {exc} — set MNEME_DAILY_TOKEN_BUDGET higher "
                         "or switch to local Ollama", fg=typer.colors.YELLOW)
@@ -153,12 +183,27 @@ def chat() -> None:
         # `iters` was added to the close-trace in v0.8; surface it in the
         # footer so the user knows how many LLM calls happened this turn.
         iters_part = _iters_footer(reply.trace_id)
+        session_part = _session_footer(session_id, session_shown)
+        session_shown = True
         typer.secho(
             f"       [trace {reply.trace_id} · citations: "
-            f"{reply.citation_quality}{iters_part}{tokens_part}{cost_part}]",
+            f"{reply.citation_quality}{iters_part}{tokens_part}{cost_part}"
+            f"{session_part}]",
             fg=typer.colors.BRIGHT_BLACK,
         )
     cx.close()
+
+
+def _session_footer(session_id: str, already_shown: bool) -> str:
+    """Return the ` · session …YZ01` (or full-ULID) footer fragment.
+
+    First turn of a session prints the full 26-char ULID so the user can
+    copy it for a future `--resume`. Later turns shrink to U+2026 ellipsis
+    + last 4 chars to keep the footer one line.
+    """
+    if already_shown:
+        return f" · session …{session_id[-4:]}"
+    return f" · session {session_id}"
 
 
 def _iters_footer(trace_id: str) -> str:
@@ -219,7 +264,7 @@ def _cost_footer(client, usage) -> str:
     return f" · ${cost:.4f}"
 
 
-def _stream_to_stdout(user_text: str, turn_id: str, cx):
+def _stream_to_stdout(user_text: str, turn_id: str, cx, *, session_id: str):
     """Drive `respond_stream`, printing chunks live; return the final Reply.
 
     With v0.8 the agent may run a tool mid-turn. Intermediate assistant text
@@ -239,6 +284,7 @@ def _stream_to_stdout(user_text: str, turn_id: str, cx):
 
     gen = respond_stream(
         user_text, turn_id, cx,
+        session_id=session_id,
         confirm_cb=_cli_confirm_tool,
         on_intermediate_text=_print_intermediate,
         # CLI exposes every registered tool — None lets the registry

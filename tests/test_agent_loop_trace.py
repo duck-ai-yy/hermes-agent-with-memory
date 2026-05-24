@@ -165,3 +165,46 @@ def test_no_tool_path_still_writes_one_close_trace(cx, fake_llm, tmp_path):
     assert len(closes) == 1
     assert closes[0]["iters"] == 1
     assert closes[0]["tool_calls"] == 0
+
+
+# ============================================================================
+# v0.10 / session_id on trace events (B3/B4 trace-level ratchets)
+# ============================================================================
+
+
+def test_B3_v10_zero_tool_call_close_trace_carries_session_id(cx, fake_llm, tmp_path):
+    """B3 (v0.10): the close-trace for a tool-enabled turn where the model
+    never asked for a tool must still carry session_id. (B3 in test_agent_loop
+    asserts iters / tool_calls; this row pins the audit-attribution.)"""
+    fake_llm.tool_call_script = [
+        {"text": "no tools", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    reply = agent.respond("hi", "turn1", cx, confirm_cb=_accept,
+                          session_id="SESS_B3")
+    closes = _close_traces(tmp_path / "events.jsonl", reply.trace_id)
+    assert closes[0]["session_id"] == "SESS_B3"
+
+
+def test_B4_v10_iter_cap_close_trace_carries_session_id(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """B4 (v0.10): the close-trace for a turn that hit the iter cap still
+    carries session_id. Pins that the early-exit path doesn't bypass the
+    session_id kwarg in _close_turn."""
+    monkeypatch.setenv("MNEME_MAX_ITERS", "2")
+    monkeypatch.setattr(
+        "mneme.agent.shell_tool.execute",
+        lambda cmd, **kw: SimpleNamespace(
+            command=cmd, exit_code=0, stdout="ok", stderr="",
+            stdout_bytes=2, stderr_bytes=0, truncated=False, duration_ms=1,
+        ),
+    )
+    fake_llm.tool_call_script = [
+        {"text": f"r{i}", "tool_calls": [_shell_call(f"c{i}")],
+         "stop_reason": "tool_use"} for i in range(5)
+    ]
+    reply = agent.respond("loop", "turn1", cx, confirm_cb=_accept,
+                          session_id="SESS_B4")
+    closes = _close_traces(tmp_path / "events.jsonl", reply.trace_id)
+    assert closes[0]["session_id"] == "SESS_B4"
+    assert "max iteration cap" in reply.text  # confirm we hit cap path
