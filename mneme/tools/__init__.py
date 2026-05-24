@@ -9,3 +9,4 @@ ships-with-mneme tools are loaded; the agent loop talks only to
 # Importing the modules triggers their @tool decorators.
 from . import shell  # noqa: F401
 from . import file_read  # noqa: F401
+from . import web_fetch  # noqa: F401
