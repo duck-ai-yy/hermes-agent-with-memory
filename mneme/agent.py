@@ -99,9 +99,25 @@ def build_prompt(user_text: str, slices: list, blueprint: str) -> tuple[str, str
 
 # -- Turn open / close (unchanged structurally from v0.7) ------------------
 
-def _open_turn(user_text: str, turn_id: str, cx: sqlite3.Connection):
-    """Stages 1-3: ingest, retrieve, build prompt; write the pre-call trace."""
-    user_sid = ingest.save_user_message(user_text, turn_id, cx)
+def _open_turn(
+    user_text: str,
+    turn_id: str,
+    cx: sqlite3.Connection,
+    *,
+    session_id: str,
+):
+    """Stages 1-3: ingest, retrieve, build prompt; write the pre-call trace.
+
+    `session_id` is required (already resolved by the caller — None gets
+    mapped to turn_id at the respond() boundary so every event downstream
+    carries a real string value, never null).
+
+    NOTE (R-19 / PRINCIPLE 2): session_id MUST NOT enter prompt_hash.
+    prompt_hash is the cache key for the LLM provider — adding session_id
+    to its input would silently halve cache hit rate. The hash here is
+    computed over `prefix + suffix` only, unchanged since v0.7.
+    """
+    user_sid = ingest.save_user_message(user_text, turn_id, cx, session_id=session_id)
     # Exclude the just-ingested user slice from its own retrieval; otherwise
     # vector search returns it first and the LLM thinks the user is repeating.
     slices = retrieve.recall(user_text, cx, exclude={user_sid})
@@ -114,6 +130,7 @@ def _open_turn(user_text: str, turn_id: str, cx: sqlite3.Connection):
     # Trace BEFORE the call so a crash mid-call still leaves a record.
     if ep is not None:
         events.append(ep, kind="trace", id=trace_id, query=user_text,
+                      session_id=session_id,
                       used_slices=[s.id for s in slices],
                       prompt_hash=soul.prompt_hash(prefix + "\n" + suffix),
                       model=client.config.chat_model, provider=client.config.provider)
@@ -129,6 +146,7 @@ def _close_turn(
     turn_id: str,
     cx,
     *,
+    session_id: str,
     accumulated_usage: Usage | None,
     accumulated_cost: float,
     had_unknown_price: bool,
@@ -149,7 +167,7 @@ def _close_turn(
       - usage never observed      -> OMIT every token + cost field (boundary 5)
     """
     citation_quality = _classify_citations(reply_text, [s.id for s in slices])
-    ingest.save_assistant_message(reply_text, turn_id, cx)
+    ingest.save_assistant_message(reply_text, turn_id, cx, session_id=session_id)
     if ep is not None:
         extra: dict = {
             "iters": iters,
@@ -166,6 +184,7 @@ def _close_turn(
             if not had_unknown_price:
                 extra["cost_usd"] = accumulated_cost
         events.append(ep, kind="trace", id=trace_id,
+                      session_id=session_id,
                       response_hash=soul.prompt_hash(reply_text),
                       citation_quality=citation_quality,
                       provider=client.config.provider, **extra)
@@ -203,6 +222,8 @@ def _price_call(client, usage: Usage) -> tuple[float, bool]:
 
 def _run_tool_call(
     tc: ToolCall, ep, trace_id: str, confirm_cb: ConfirmCb,
+    *,
+    session_id: str,
 ) -> tuple[dict, bool]:
     """Run one tool call with audit + confirm. Return (tool_result_block, ran).
 
@@ -210,12 +231,16 @@ def _run_tool_call(
     layer keeps confirm + audit (the layering invariant from v0.8 — tools
     themselves never touch events.jsonl). `ran` is True iff the tool was
     actually invoked (False on rejection).
+
+    v0.10: every event emitted here carries session_id so the audit log can
+    be sliced by chat session as easily as by trace.
     """
     args = tc.arguments or {}
     # Audit the *pending* decision so a crash between confirm and execute
     # still leaves a breadcrumb (principle 5).
     if ep is not None:
         events.append(ep, kind="tool_audit", trace_id=trace_id,
+                      session_id=session_id,
                       tool=tc.name, decision="pending",
                       tool_call_id=tc.id, arguments=args)
     try:
@@ -224,6 +249,7 @@ def _run_tool_call(
         # confirm callback itself failed — log specifically, treat as reject.
         if ep is not None:
             events.append(ep, kind="tool_audit", trace_id=trace_id,
+                          session_id=session_id,
                           tool=tc.name, decision="rejected",
                           tool_call_id=tc.id,
                           reason=f"confirm_cb {type(exc).__name__}: {exc}")
@@ -232,12 +258,14 @@ def _run_tool_call(
     if not approved:
         if ep is not None:
             events.append(ep, kind="tool_audit", trace_id=trace_id,
+                          session_id=session_id,
                           tool=tc.name, decision="rejected",
                           tool_call_id=tc.id)
         return _reject_block(tc, "Tool call rejected by user."), False
 
     if ep is not None:
         events.append(ep, kind="tool_audit", trace_id=trace_id,
+                      session_id=session_id,
                       tool=tc.name, decision="accepted",
                       tool_call_id=tc.id)
 
@@ -251,6 +279,7 @@ def _run_tool_call(
     if ep is not None:
         event_kwargs: dict = {
             "trace_id": trace_id,
+            "session_id": session_id,
             "tool": tc.name,
             "tool_call_id": tc.id,
         }
@@ -356,6 +385,7 @@ def _agent_loop(
     trace_id: str,
     confirm_cb: ConfirmCb | None,
     *,
+    session_id: str,
     on_intermediate_text: Callable[[str], None] | None = None,
     allowed_tools: list[str] | None = None,
 ):
@@ -425,7 +455,9 @@ def _agent_loop(
         any_rejected = False
         for tc in asst.tool_calls:
             tool_calls_count += 1
-            result_block, ran = _run_tool_call(tc, ep, trace_id, confirm_cb)
+            result_block, ran = _run_tool_call(
+                tc, ep, trace_id, confirm_cb, session_id=session_id,
+            )
             tool_results.append(result_block)
             if not ran:
                 any_rejected = True
@@ -463,6 +495,7 @@ def respond(
     turn_id: str,
     cx: sqlite3.Connection,
     *,
+    session_id: str | None = None,
     confirm_cb: ConfirmCb | None = None,
     on_intermediate_text: Callable[[str], None] | None = None,
     allowed_tools: list[str] | None = None,
@@ -476,15 +509,24 @@ def respond(
     `allowed_tools` filters the registry: None = every registered tool,
     [] = no tools (server uses this; agent loop degrades to no-tool path),
     a list of names = exactly that subset.
+
+    `session_id` groups turns into a chat session (v0.10). None falls back
+    to turn_id so legacy v0.7-v0.9 callers preserve the one-turn-one-session
+    semantics the migration back-fill assumed.
     """
-    slices, prefix, suffix, trace_id, client, ep = _open_turn(user_text, turn_id, cx)
+    sess = session_id if session_id is not None else turn_id
+    slices, prefix, suffix, trace_id, client, ep = _open_turn(
+        user_text, turn_id, cx, session_id=sess,
+    )
     reply_text, totals = _agent_loop(
         prefix, suffix, client, ep, trace_id, confirm_cb,
+        session_id=sess,
         on_intermediate_text=on_intermediate_text,
         allowed_tools=allowed_tools,
     )
     return _close_turn(
         reply_text, slices, trace_id, client, ep, turn_id, cx,
+        session_id=sess,
         accumulated_usage=totals["usage"],
         accumulated_cost=totals["cost"],
         had_unknown_price=totals["had_unknown_price"],
@@ -499,6 +541,7 @@ def respond_stream(
     turn_id: str,
     cx: sqlite3.Connection,
     *,
+    session_id: str | None = None,
     confirm_cb: ConfirmCb | None = None,
     on_intermediate_text: Callable[[str], None] | None = None,
     allowed_tools: list[str] | None = None,
@@ -512,8 +555,14 @@ def respond_stream(
     tools, then yields the final assistant text as a single chunk. M1 keeps
     the streaming-of-tool-args spike out of scope — see
     docs/knowledge/provider-tool-calling.md §3.
+
+    `session_id` groups turns into a chat session (v0.10). None falls back
+    to turn_id (see respond()).
     """
-    slices, prefix, suffix, trace_id, client, ep = _open_turn(user_text, turn_id, cx)
+    sess = session_id if session_id is not None else turn_id
+    slices, prefix, suffix, trace_id, client, ep = _open_turn(
+        user_text, turn_id, cx, session_id=sess,
+    )
 
     if confirm_cb is None:
         # v0.7 streaming path, preserved verbatim except for the close_turn
@@ -533,6 +582,7 @@ def respond_stream(
             cost, had_unknown = _price_call(client, usage)
         return _close_turn(
             "".join(chunks), slices, trace_id, client, ep, turn_id, cx,
+            session_id=sess,
             accumulated_usage=usage, accumulated_cost=cost,
             had_unknown_price=had_unknown, iters=1,
             tool_calls_count=0, tool_rejects_count=0,
@@ -541,6 +591,7 @@ def respond_stream(
     # Tool-enabled streaming: run the loop non-stream, yield final text once.
     reply_text, totals = _agent_loop(
         prefix, suffix, client, ep, trace_id, confirm_cb,
+        session_id=sess,
         on_intermediate_text=on_intermediate_text,
         allowed_tools=allowed_tools,
     )
@@ -548,6 +599,7 @@ def respond_stream(
         yield reply_text
     return _close_turn(
         reply_text, slices, trace_id, client, ep, turn_id, cx,
+        session_id=sess,
         accumulated_usage=totals["usage"],
         accumulated_cost=totals["cost"],
         had_unknown_price=totals["had_unknown_price"],
