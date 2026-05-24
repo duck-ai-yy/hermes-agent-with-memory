@@ -22,15 +22,27 @@ from .embed import embed
 log = logging.getLogger("mneme.ingest")
 
 
-def _save(text: str, role: str, turn_id: str, cx: sqlite3.Connection) -> str:
+def _save(
+    text: str,
+    role: str,
+    turn_id: str,
+    cx: sqlite3.Connection,
+    *,
+    session_id: str | None = None,
+) -> str:
     sid = ulid()
     now = int(time.time())
     vector = embed(text, cx)
+    # v0.10: a None session_id falls back to turn_id so legacy single-turn
+    # callers keep the one-turn-one-session semantics that the migration
+    # back-fill assumed for pre-v0.10 rows.
+    sess = session_id if session_id is not None else turn_id
 
     with store.tx(cx):
         cx.execute(
-            "INSERT INTO slices(id, role, text, turn_id, created_at) VALUES (?, ?, ?, ?, ?)",
-            (sid, role, text, turn_id, now),
+            "INSERT INTO slices(id, role, text, turn_id, session_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (sid, role, text, turn_id, sess, now),
         )
         cx.execute(
             "INSERT INTO vec_slices(slice_id, embedding) VALUES (?, ?)", (sid, vector)
@@ -68,15 +80,27 @@ def _save(text: str, role: str, turn_id: str, cx: sqlite3.Connection) -> str:
     ep = store.events_path(cx)
     if ep is not None:
         events.append(ep, kind="ingest", slice_id=sid, role=role, turn_id=turn_id,
-                      nodes=nodes_added, edges=edges_added)
+                      session_id=sess, nodes=nodes_added, edges=edges_added)
     return sid
 
 
-def save_user_message(text: str, turn_id: str, cx: sqlite3.Connection) -> str:
+def save_user_message(
+    text: str,
+    turn_id: str,
+    cx: sqlite3.Connection,
+    *,
+    session_id: str | None = None,
+) -> str:
     """Persist a user message and its concept graph. Return the new slice id."""
-    return _save(text, "user", turn_id, cx)
+    return _save(text, "user", turn_id, cx, session_id=session_id)
 
 
-def save_assistant_message(text: str, turn_id: str, cx: sqlite3.Connection) -> str:
+def save_assistant_message(
+    text: str,
+    turn_id: str,
+    cx: sqlite3.Connection,
+    *,
+    session_id: str | None = None,
+) -> str:
     """Persist an assistant reply so it can be retrieved in later turns."""
-    return _save(text, "assistant", turn_id, cx)
+    return _save(text, "assistant", turn_id, cx, session_id=session_id)
