@@ -20,6 +20,7 @@ from . import paths
 from .agent import respond_stream
 from .ids import ulid
 from .llm import client as _llm
+from .llm import pricing
 from .llm.client import BudgetExceeded, LLMConfig, configure
 from .memory import forget as forget_mod
 from .memory import retrieve, store
@@ -145,14 +146,34 @@ def chat() -> None:
             typer.secho(f"\nerror: {exc}", fg=typer.colors.RED)
             continue
         last_trace = reply.trace_id
-        usage = getattr(_llm.get_client(), "last_usage", None)
+        client = _llm.get_client()
+        usage = getattr(client, "last_usage", None)
         tokens_part = f" · tokens: {usage.total_tokens}" if usage else ""
+        cost_part = _cost_footer(client, usage) if usage else ""
         typer.secho(
             f"       [trace {reply.trace_id} · citations: "
-            f"{reply.citation_quality}{tokens_part}]",
+            f"{reply.citation_quality}{tokens_part}{cost_part}]",
             fg=typer.colors.BRIGHT_BLACK,
         )
     cx.close()
+
+
+def _cost_footer(client, usage) -> str:
+    """Format the ` · $X.XXXX` suffix for the REPL footer.
+
+    Returns `· $?` when the model isn't priced and `· <$0.0001` for sub-cent
+    spend — the user picks "unknown" vs "essentially free" at a glance.
+    Pricing failures degrade silently to `· $?`; they must not break the REPL.
+    """
+    try:
+        cost = pricing.cost_usd(client.config.provider, client.config.chat_model, usage)
+    except Exception:
+        cost = None
+    if cost is None:
+        return " · $?"
+    if 0 < cost < 0.0001:
+        return " · <$0.0001"
+    return f" · ${cost:.4f}"
 
 
 def _stream_to_stdout(user_text: str, turn_id: str, cx):
@@ -223,12 +244,17 @@ def stats() -> None:
         f"tokens   in: {totals['prompt']:,}  out: {totals['completion']:,}  "
         f"total: {totals['total']:,}"
     )
-    today = events.sum_cloud_tokens_since(paths.EVENTS_PATH, events.today_start_ts())
+    today_start = events.today_start_ts()
+    today = events.sum_cloud_tokens_since(paths.EVENTS_PATH, today_start)
     budget = _budget_from_env()
     if budget > 0:
         typer.echo(f"today    {today:,} / {budget:,} cloud tokens")
     else:
         typer.echo(f"today    {today:,} cloud tokens (no budget)")
+    cost, priced, unpriced = _today_cost_breakdown(paths.EVENTS_PATH, today_start)
+    typer.echo(
+        f"today cost: ${cost:.4f} ({priced} priced, {unpriced} unpriced)"
+    )
 
 
 def _token_totals(events_path) -> dict:
@@ -251,6 +277,42 @@ def _token_totals(events_path) -> dict:
             totals["completion"] += rec.get("completion_tokens", 0)
             totals["total"] += rec.get("total_tokens", 0)
     return totals
+
+
+def _today_cost_breakdown(events_path, since_ts: int) -> tuple[float, int, int]:
+    """Sum today's logged cost_usd and count priced vs unpriced turn-close traces.
+
+    A "priced" trace = the turn-close event carried `cost_usd` (known model).
+    "Unpriced" = the turn-close event had `total_tokens` but no `cost_usd`
+    (unknown-model path). We sum what was *logged*, never re-pricing from the
+    current table — past turns keep their original cost even if prices drift.
+    """
+    cost = 0.0
+    priced = 0
+    unpriced = 0
+    if not events_path.exists():
+        return cost, priced, unpriced
+    with open(events_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("kind") != "trace" or rec.get("ts", 0) < since_ts:
+                continue
+            # Only turn-close events carry total_tokens; the pre-call trace
+            # row for the same id has neither tokens nor cost.
+            if "total_tokens" not in rec:
+                continue
+            if "cost_usd" in rec:
+                cost += rec["cost_usd"]
+                priced += 1
+            else:
+                unpriced += 1
+    return cost, priced, unpriced
 
 
 @app.command()

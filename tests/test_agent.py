@@ -125,3 +125,91 @@ def test_closing_trace_event_records_provider_for_budget_filtering(cx, fake_llm,
     ]
     assert len(closing) == 1
     assert closing[0]["provider"] == fake_llm.config.provider
+
+
+# -- v0.7 cost field on close-trace ------------------------------------------
+# These exercise `_close_turn`'s pricing wiring directly against fake_llm —
+# the integration counterpart to the pure tests in test_pricing.py.
+
+def _closing_trace(events_path, trace_id) -> dict:
+    """Return the close-trace record (the one with total_tokens) for trace_id."""
+    records = [
+        json.loads(line) for line in
+        events_path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    closes = [
+        r for r in records
+        if r.get("id") == trace_id and "total_tokens" in r
+    ]
+    assert len(closes) == 1, f"expected 1 closing trace, got {len(closes)}"
+    return closes[0]
+
+
+def test_close_trace_records_zero_cost_for_ollama(cx, fake_llm, tmp_path):
+    """Boundary 3 at the trace layer: fake_llm.config.provider is 'ollama',
+    so the closing trace must carry cost_usd=0.0 (a known, real value)."""
+    reply = agent.respond("ollama turn", "turn1", cx)
+    rec = _closing_trace(tmp_path / "events.jsonl", reply.trace_id)
+    assert rec["cost_usd"] == 0.0
+
+
+def test_close_trace_omits_cost_field_for_unknown_provider(cx, fake_llm, tmp_path):
+    """Boundary 1 at the trace layer: switch provider to something the price
+    table doesn't know; pricing returns None and `_close_turn` must OMIT the
+    cost_usd field (not write null, not write 0). Historical sums depend on
+    this: an unknown turn must not silently zero into `today cost`."""
+    fake_llm.config.provider = "xai"
+    fake_llm.config.chat_model = "grok-2"
+    reply = agent.respond("unknown provider turn", "turn1", cx)
+    rec = _closing_trace(tmp_path / "events.jsonl", reply.trace_id)
+    assert "cost_usd" not in rec
+    # But the tokens MUST still be there — unknown price ≠ unknown usage.
+    assert rec["total_tokens"] > 0
+
+
+def test_close_trace_omits_cost_field_for_known_provider_unknown_model(
+    cx, fake_llm, tmp_path,
+):
+    """Boundary 2 at the trace layer: openai + made-up model -> still omit."""
+    fake_llm.config.provider = "openai"
+    fake_llm.config.chat_model = "gpt-imaginary"
+    reply = agent.respond("known provider unknown model", "turn1", cx)
+    rec = _closing_trace(tmp_path / "events.jsonl", reply.trace_id)
+    assert "cost_usd" not in rec
+
+
+def test_close_trace_writes_no_tokens_when_usage_is_none(cx, fake_llm, tmp_path):
+    """Boundary 5: if client.last_usage is None, the close-trace must carry
+    neither tokens nor cost_usd. Otherwise `stats` would mis-classify the
+    turn as unpriced (count++ for nothing). Use the streaming path AND
+    monkeypatch last_usage back to None after the stream finishes — that
+    catches the agent reading last_usage at the right moment."""
+    # We use respond() (non-stream) and monkeypatch FakeLLM.chat so last_usage
+    # stays None after the call returns. Easier than overriding the
+    # streaming generator's post-loop assignment.
+    original_chat = fake_llm.chat
+
+    def chat_no_usage(messages, *, stream=True):
+        result = original_chat(messages, stream=stream)
+        fake_llm.last_usage = None
+        return result
+
+    fake_llm.chat = chat_no_usage
+    reply = agent.respond("no usage", "turn1", cx)
+
+    records = [
+        json.loads(line) for line in
+        (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    # No closing trace ever carries total_tokens for this turn.
+    closes_for_turn = [
+        r for r in records
+        if r.get("id") == reply.trace_id and r.get("response_hash")
+    ]
+    assert len(closes_for_turn) == 1
+    close = closes_for_turn[0]
+    assert "total_tokens" not in close
+    assert "prompt_tokens" not in close
+    assert "completion_tokens" not in close
+    assert "cost_usd" not in close

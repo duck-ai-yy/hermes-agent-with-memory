@@ -1,0 +1,25 @@
+# USD per 1M tokens. Ships with the package so the table travels with code.
+# Ollama is hard-coded as $0.0 in pricing.py (local, free) and intentionally
+# absent from this table.
+#
+# Update cadence: when a provider publishes a price change, edit here.
+# Historical cost_usd values written to events.jsonl are NOT recomputed —
+# `stats` re-sums what was logged, so old turns keep their original price.
+openai:
+  gpt-4o:
+    input: 2.50
+    output: 10.00
+  gpt-4o-mini:
+    input: 0.15
+    output: 0.60
+anthropic:
+  claude-sonnet-4-6:
+    input: 3.00
+    output: 15.00
+  claude-haiku-4-5:
+    input: 1.00
+    output: 5.00
+deepseek:
+  deepseek-chat:
+    input: 0.27
+    output: 1.10
