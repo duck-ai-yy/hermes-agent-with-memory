@@ -242,3 +242,33 @@ def test_explain_does_not_invent_cost_usd_for_unpriced_trace(runner, home_paths)
     result = runner.invoke(cli.app, ["explain", "TID-002"])
     assert result.exit_code == 0, result.stdout
     assert "cost_usd" not in result.stdout
+
+
+# ---------- price-drift invariant (test lead caveat) -------------------------
+
+def test_today_cost_breakdown_uses_logged_cost_not_current_price_table(tmp_path, monkeypatch):
+    """Architect #10 sub-invariant: the daily cost sum reads `cost_usd`
+    directly from each trace event — it must NOT re-price by calling
+    `pricing.cost_usd(provider, model, usage)` against the current table.
+    This protects historical spend from price-table drift (someone updates
+    pricing.yaml; yesterday's recorded cost stays the same).
+    """
+    ep = tmp_path / "events.jsonl"
+    now = int(time.time())
+    ep.write_text(
+        json.dumps({
+            "ts": now, "kind": "trace", "id": "T1",
+            "provider": "openai", "model": "gpt-4o",
+            "prompt_tokens": 1000, "completion_tokens": 500,
+            "total_tokens": 1500,
+            "cost_usd": 0.0075,
+        }) + "\n"
+    )
+    # If anyone ever "optimizes" stats to re-price from the current table,
+    # this monkeypatch returns 10× the logged value and the assertion fires.
+    monkeypatch.setattr(pricing, "cost_usd", lambda *a, **kw: 0.075)
+
+    cost, priced, unpriced = cli._today_cost_breakdown(ep, 0)
+    assert cost == 0.0075   # logged value, not the 10× monkeypatched price
+    assert priced == 1
+    assert unpriced == 0
