@@ -20,7 +20,7 @@ from .memory import forget as forget_mod
 from .memory import store
 from .trace import events
 
-app = FastAPI(title="Mneme", version="0.3.0")
+app = FastAPI(title="Mneme", version="0.8.0")
 
 
 class ChatRequest(BaseModel):
@@ -47,7 +47,11 @@ async def chat(req: ChatRequest) -> dict:
 
     def work():
         with _db() as cx:
-            r = respond(user_msgs[-1]["content"], turn_id, cx)
+            # confirm_cb=None on purpose: HTTP /chat has no UI to confirm a
+            # tool call interactively. The agent loop degrades to the v0.7
+            # single-call path (no tools declared, no tool round-trips).
+            # Server-side tool calling is a v0.13+ design problem.
+            r = respond(user_msgs[-1]["content"], turn_id, cx, confirm_cb=None)
             return {"text": r.text, "trace_id": r.trace_id, "citation_quality": r.citation_quality}
 
     return await asyncio.to_thread(work)

@@ -150,12 +150,55 @@ def chat() -> None:
         usage = getattr(client, "last_usage", None)
         tokens_part = f" · tokens: {usage.total_tokens}" if usage else ""
         cost_part = _cost_footer(client, usage) if usage else ""
+        # `iters` was added to the close-trace in v0.8; surface it in the
+        # footer so the user knows how many LLM calls happened this turn.
+        iters_part = _iters_footer(reply.trace_id)
         typer.secho(
             f"       [trace {reply.trace_id} · citations: "
-            f"{reply.citation_quality}{tokens_part}{cost_part}]",
+            f"{reply.citation_quality}{iters_part}{tokens_part}{cost_part}]",
             fg=typer.colors.BRIGHT_BLACK,
         )
     cx.close()
+
+
+def _iters_footer(trace_id: str) -> str:
+    """Read iters from the just-written close-trace event. Best effort —
+    if the events file is unreadable the footer simply omits the field."""
+    try:
+        record = events.explain(paths.EVENTS_PATH, trace_id)
+    except (KeyError, FileNotFoundError, OSError):
+        return ""
+    iters = record.get("iters")
+    return f" · iters: {iters}" if iters else ""
+
+
+def _cli_confirm_tool(name: str, args: dict) -> bool:
+    """Confirmation callback handed to the agent loop.
+
+    Renders the proposed command short-form, then prompts y/N (default N).
+    Keeping the prompt one-shot: the model already showed any "I'm going
+    to..." text via the intermediate-text callback; this prompt is purely
+    the safety gate.
+    """
+    if name == "shell":
+        cmd = args.get("command", "")
+        typer.secho(f"       [tool] shell: {cmd}", fg=typer.colors.CYAN)
+    else:
+        typer.secho(f"       [tool] {name}: {args}", fg=typer.colors.CYAN)
+    return typer.confirm("       run this command?", default=False)
+
+
+def _print_intermediate(text: str) -> None:
+    """Render an intermediate assistant message (between tool calls).
+
+    Visually distinct from the final `mneme>` reply so the user can tell
+    "what the agent is about to do" from "what the agent finally said".
+    The sentinel format is `       …` (5 leading spaces + ellipsis) on the
+    first line, matching the indent of the footer line.
+    """
+    if not text.strip():
+        return
+    typer.secho(f"       … {text}", fg=typer.colors.BRIGHT_BLACK)
 
 
 def _cost_footer(client, usage) -> str:
@@ -177,10 +220,28 @@ def _cost_footer(client, usage) -> str:
 
 
 def _stream_to_stdout(user_text: str, turn_id: str, cx):
-    """Drive `respond_stream`, printing chunks live; return the final Reply."""
-    sys.stdout.write("mneme> ")
-    sys.stdout.flush()
-    gen = respond_stream(user_text, turn_id, cx)
+    """Drive `respond_stream`, printing chunks live; return the final Reply.
+
+    With v0.8 the agent may run a tool mid-turn. Intermediate assistant text
+    ("I'll do X first…") prints on its own indented line BEFORE the confirm
+    prompt; the `mneme> ` header is deferred until the final text starts
+    streaming so it stays adjacent to the last reply (no awkward empty
+    `mneme> ` followed by the tool prompt).
+    """
+    header_printed = False
+
+    def ensure_header() -> None:
+        nonlocal header_printed
+        if not header_printed:
+            sys.stdout.write("mneme> ")
+            sys.stdout.flush()
+            header_printed = True
+
+    gen = respond_stream(
+        user_text, turn_id, cx,
+        confirm_cb=_cli_confirm_tool,
+        on_intermediate_text=_print_intermediate,
+    )
     reply = None
     while True:
         try:
@@ -188,8 +249,12 @@ def _stream_to_stdout(user_text: str, turn_id: str, cx):
         except StopIteration as stop:
             reply = stop.value
             break
+        ensure_header()
         sys.stdout.write(chunk)
         sys.stdout.flush()
+    # If the turn produced no streamed chunks (e.g. rejection-only path),
+    # still print an empty `mneme>` line so the footer hangs off something.
+    ensure_header()
     sys.stdout.write("\n")
     sys.stdout.flush()
     return reply
