@@ -39,11 +39,24 @@ def _db():
 
 @app.post("/chat")
 async def chat(req: ChatRequest) -> dict:
-    """Run a chat turn from the last user message."""
+    """Run a chat turn from the last user message.
+
+    v0.10: `session_id` is independent of `turn_id`. A fresh turn_id is
+    minted every request (pre-v0.10 collapsed the two, which silently
+    grouped every HTTP-driven turn under the same id). The session_id
+    follows §7 of the design: None or whitespace-only -> mint a new ULID;
+    any non-empty string is accepted silently (the server is stateless and
+    never raises SessionNotFound).
+    """
     user_msgs = [m for m in req.messages if m.get("role") == "user"]
     if not user_msgs:
         raise HTTPException(400, "no user message in request")
-    turn_id = req.session_id or ulid()
+    turn_id = ulid()
+    raw_sess = req.session_id
+    if raw_sess is None or raw_sess.strip() == "":
+        session_id = ulid()
+    else:
+        session_id = raw_sess
 
     def work():
         with _db() as cx:
@@ -55,8 +68,17 @@ async def chat(req: ChatRequest) -> dict:
             # future change accidentally injects a confirm_cb here, the
             # empty allowlist will keep the server from declaring any tool.
             r = respond(user_msgs[-1]["content"], turn_id, cx,
+                        session_id=session_id,
                         confirm_cb=None, allowed_tools=[])
-            return {"text": r.text, "trace_id": r.trace_id, "citation_quality": r.citation_quality}
+            # Response field order is pinned (design §7): text, trace_id,
+            # citation_quality, session_id. Insertion order matters because
+            # FastAPI serializes the dict directly.
+            return {
+                "text": r.text,
+                "trace_id": r.trace_id,
+                "citation_quality": r.citation_quality,
+                "session_id": session_id,
+            }
 
     return await asyncio.to_thread(work)
 
