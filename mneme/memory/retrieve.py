@@ -25,6 +25,7 @@ class Slice:
     role: str
     text: str
     created_at: int
+    score: float = 0.0
 
 
 class _GraphDB:
@@ -91,7 +92,7 @@ def recall(
 
     result: list[Slice] = []
     budget = _CHAR_BUDGET
-    for _, sid in scored:
+    for neg_score, sid in scored:
         if sid in exclude:
             continue
         row = cx.execute(
@@ -102,5 +103,5 @@ def recall(
         if result and budget - len(row[2]) < 0:
             break
         budget -= len(row[2])
-        result.append(Slice(row[0], row[1], row[2], row[3]))
+        result.append(Slice(row[0], row[1], row[2], row[3], -neg_score))
     return result

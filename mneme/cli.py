@@ -22,7 +22,7 @@ from .ids import ulid
 from .llm import client as _llm
 from .llm.client import BudgetExceeded, LLMConfig, configure
 from .memory import forget as forget_mod
-from .memory import store
+from .memory import retrieve, store
 from .trace import events
 
 app = typer.Typer(add_completion=False, help="Local-first chat agent with memory.")
@@ -251,6 +251,49 @@ def _token_totals(events_path) -> dict:
             totals["completion"] += rec.get("completion_tokens", 0)
             totals["total"] += rec.get("total_tokens", 0)
     return totals
+
+
+@app.command()
+def search(
+    query: str,
+    k: int = typer.Option(10, "-k", "--k"),
+    hops: int = 2,
+    width: int = 100,
+    full: bool = False,
+) -> None:
+    """Vector + graph search over long-term memory. Read-only, no LLM."""
+    if not query.strip():
+        typer.echo("empty query")
+        return
+    _configure_llm()
+    cx = _open_db()
+    try:
+        hits = retrieve.recall(query, cx, k=k, hops=hops)
+    except Exception as exc:
+        typer.secho(f"embed provider unreachable: {exc}", fg=typer.colors.RED)
+        cx.close()
+        raise typer.Exit(1)
+    cx.close()
+    _print_hits(hits, query, k, hops, width, full)
+
+
+def _print_hits(hits, query: str, k: int, hops: int, width: int, full: bool) -> None:
+    if not hits:
+        typer.echo(f'no hits · query="{query}" · k={k}')
+        return
+    typer.echo(f"{'score':<6} {'id':<26} {'role':<10} {'when':<16} text")
+    for s in hits:
+        typer.echo(_format_hit(s, width, full))
+    typer.echo(f'{len(hits)} hits · query="{query}" · k={k} · hops={hops}')
+
+
+def _format_hit(s, width: int, full: bool) -> str:
+    width = max(1, width)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.created_at))
+    text = s.text.replace("\n", " ⏎ ")
+    if not full and len(text) > width:
+        text = text[:width] + "…"
+    return f"{s.score:.3f}  {s.id:<26} {s.role:<10} {when}  {text}"
 
 
 @app.command()
