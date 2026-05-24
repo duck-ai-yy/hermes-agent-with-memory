@@ -6,10 +6,16 @@ v0.8: `chat()` also handles a `tools` kwarg. When tools are passed, the fake
 returns an `AssistantMessage` driven by `tool_call_script` (a list of canned
 turn outputs popped one per call). The default script ends the turn cleanly
 so older tests that didn't set the script still get sane behavior.
+
+The fake also keeps spy fields (`messages_seen`, `stream_flags_seen`,
+`tools_seen`, `usage_script`) so tests can verify per-call inputs (especially
+that the SECOND-round messages list carries a `tool_result` with `is_error`
+set — the v0.6 "happy-path lying" lesson applied to the agent loop).
 """
 
 from __future__ import annotations
 
+import copy
 import random
 import struct
 from types import SimpleNamespace
@@ -39,9 +45,23 @@ class FakeLLM:
         # self.reply — so the loop terminates and stale scripts can't hang
         # the test runner.
         self.tool_call_script: list = []
+        # Per-call usage override; one entry consumed per chat() call. A None
+        # entry means "use the auto-derived fake usage" (the default). When
+        # the script is exhausted falls back to auto. Used by cost / trace
+        # accumulation tests that need known token counts per round.
+        self.usage_script: list = []
+        # Spies — captured at each chat() call so tests can assert what the
+        # agent actually fed the LLM. messages is deep-copied because the
+        # agent loop mutates the running list across iterations.
+        self.messages_seen: list[list[dict]] = []
+        self.stream_flags_seen: list[bool] = []
+        self.tools_seen: list = []
 
     def chat(self, messages: list[dict], *, stream: bool = True, tools=None):
         self.chat_calls += 1
+        self.messages_seen.append(copy.deepcopy(messages))
+        self.stream_flags_seen.append(stream)
+        self.tools_seen.append(copy.deepcopy(tools) if tools is not None else None)
         self.last_usage = None
         if tools:
             # Tool-using path: respect the script; default to a clean end_turn.
@@ -60,14 +80,22 @@ class FakeLLM:
                 )
             # Token usage is reported even when the model called a tool — the
             # agent loop accumulates across iterations for the close-trace.
-            self.last_usage = self._fake_usage(msg.text or "tool")
+            self.last_usage = self._next_usage(msg.text or "tool")
             return msg
         system = messages[0]["content"]
         text = self.concept_json if "STRICT JSON" in system else self.reply
         if not stream:
-            self.last_usage = self._fake_usage(text)
+            self.last_usage = self._next_usage(text)
             return text
         return self._stream_chunks(text)
+
+    def _next_usage(self, text: str) -> SimpleNamespace:
+        """Honor `usage_script` if non-empty (None means auto); else auto."""
+        if self.usage_script:
+            override = self.usage_script.pop(0)
+            if override is not None:
+                return override
+        return self._fake_usage(text)
 
     def _stream_chunks(self, text: str):
         # Three roughly-equal chunks — enough to exercise the streaming path
@@ -81,7 +109,7 @@ class FakeLLM:
                 start = i * step
                 end = start + step if i < n - 1 else len(text)
                 yield text[start:end]
-        self.last_usage = self._fake_usage(text)
+        self.last_usage = self._next_usage(text)
 
     @staticmethod
     def _fake_usage(text: str) -> SimpleNamespace:
