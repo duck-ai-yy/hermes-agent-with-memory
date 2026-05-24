@@ -11,15 +11,24 @@ The fake also keeps spy fields (`messages_seen`, `stream_flags_seen`,
 `tools_seen`, `usage_script`) so tests can verify per-call inputs (especially
 that the SECOND-round messages list carries a `tool_result` with `is_error`
 set — the v0.6 "happy-path lying" lesson applied to the agent loop).
+
+v0.9: four new opt-in fixtures for the registry / tools test suite —
+`isolated_registry`, `mock_httpx`, `mock_getaddrinfo`, `events_spy`. The
+registry snapshot/restore fixture is opt-in here; test_tool_registry.py
+flips it autouse at module scope so every test there starts from a clean
+slate. Other files opt in only where they need it (e.g. tests that decorate
+a fresh @tool fn).
 """
 
 from __future__ import annotations
 
 import copy
+import json
 import random
 import struct
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from mneme.llm.client import AssistantMessage
@@ -135,3 +144,137 @@ def cx(tmp_path):
     store.init_db(connection)
     yield connection
     connection.close()
+
+
+# -- v0.9 / M2 fixtures -----------------------------------------------------
+
+
+@pytest.fixture
+def isolated_registry():
+    """Snapshot/restore `mneme.tools.registry._REGISTRY` around one test.
+
+    The registry is module-level state populated at import time by
+    `@tool` decorations on each tool module. Tests that decorate fresh
+    functions (B1-B11) or that mutate the registry must run with this
+    fixture or they pollute every later test. Opt-in for most files;
+    test_tool_registry.py flips it autouse via module-scope `pytestmark`.
+
+    Restores by replacing the dict contents in place (not rebinding) so
+    any cached reference to `_REGISTRY` still sees the original state.
+    """
+    from mneme.tools import registry as _reg
+    snapshot = dict(_reg._REGISTRY)
+    try:
+        yield _reg._REGISTRY
+    finally:
+        _reg._REGISTRY.clear()
+        _reg._REGISTRY.update(snapshot)
+
+
+@pytest.fixture
+def mock_httpx(monkeypatch):
+    """Install a programmable transport that web_fetch's `httpx.Client` will
+    use. `web_fetch` constructs its own `httpx.Client(...)` inside the tool,
+    so we monkeypatch `httpx.Client.__init__` to inject our transport.
+
+    Usage:
+        def test_x(mock_httpx):
+            mock_httpx.set_handler(lambda req: httpx.Response(200, text="hi"))
+            ...
+
+    The handler receives an `httpx.Request` and must return an
+    `httpx.Response`. Multi-step (redirect) flows can stash a list of
+    handlers via `set_handlers([h1, h2, ...])` to pop one per call.
+    """
+    state: dict = {"handler": None, "handlers": None, "calls": []}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        state["calls"].append(request)
+        if state["handlers"] is not None:
+            if not state["handlers"]:
+                raise AssertionError("mock_httpx handler queue exhausted")
+            h = state["handlers"].pop(0)
+            return h(request)
+        if state["handler"] is None:
+            raise AssertionError(
+                "mock_httpx: no handler installed; call set_handler/set_handlers"
+            )
+        return state["handler"](request)
+
+    transport = httpx.MockTransport(_handler)
+    real_init = httpx.Client.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "__init__", patched_init)
+
+    spy = SimpleNamespace(
+        set_handler=lambda h: state.update(handler=h, handlers=None),
+        set_handlers=lambda hs: state.update(handlers=list(hs), handler=None),
+        calls=state["calls"],
+    )
+    return spy
+
+
+@pytest.fixture
+def mock_getaddrinfo(monkeypatch):
+    """Programmable socket.getaddrinfo for SSRF preflight tests.
+
+    Set a host -> address (or list of addresses) mapping. Unknown hosts
+    raise socket.gaierror so tests catch missing entries instead of
+    silently hitting the real DNS resolver. Opt-in: not autouse.
+    """
+    import socket
+    state: dict = {"mapping": {}}
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host not in state["mapping"]:
+            raise socket.gaierror(-2, f"unknown host (mock): {host}")
+        addrs = state["mapping"][host]
+        if isinstance(addrs, str):
+            addrs = [addrs]
+        # Mimic the real getaddrinfo tuple shape: (family, type, proto,
+        # canonname, sockaddr=(addr, port)).
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (a, port or 0))
+                for a in addrs]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+    spy = SimpleNamespace(
+        set=lambda host, addrs: state["mapping"].__setitem__(host, addrs),
+        mapping=state["mapping"],
+    )
+    return spy
+
+
+@pytest.fixture
+def events_spy(tmp_path):
+    """Callable that loads events.jsonl from tmp_path and filters records.
+
+    Usage:
+        recs = events_spy(kind="tool_result")
+        recs = events_spy(predicate=lambda r: r.get("error") == "Timeout")
+        recs = events_spy()      # all records
+    """
+    def _load(*, kind: str | None = None, predicate=None) -> list[dict]:
+        ep = tmp_path / "events.jsonl"
+        if not ep.exists():
+            return []
+        out: list[dict] = []
+        for line in ep.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if kind is not None and rec.get("kind") != kind:
+                continue
+            if predicate is not None and not predicate(rec):
+                continue
+            out.append(rec)
+        return out
+    return _load
