@@ -97,7 +97,8 @@ def _close_turn(reply_text, slices, trace_id, client, ep, turn_id, cx) -> Reply:
             }
         events.append(ep, kind="trace", id=trace_id,
                       response_hash=soul.prompt_hash(reply_text),
-                      citation_quality=citation_quality, **extra)
+                      citation_quality=citation_quality,
+                      provider=client.config.provider, **extra)
     return Reply(reply_text, trace_id, citation_quality)
 
 

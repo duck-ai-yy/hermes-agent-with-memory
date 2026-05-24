@@ -30,6 +30,16 @@ class Usage:
         return self.prompt_tokens + self.completion_tokens
 
 
+class BudgetExceeded(Exception):
+    """Raised before a cloud chat call when today's spend would exceed the
+    configured daily token budget. Ollama (local, free) is never blocked."""
+
+    def __init__(self, used: int, budget: int) -> None:
+        self.used = used
+        self.budget = budget
+        super().__init__(f"daily token budget exhausted: {used:,}/{budget:,}")
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     # Chat provider.
@@ -52,6 +62,11 @@ class LLMConfig:
                                         # exact-text matches only.
 
     events_path: Path | None = None     # where audit events are written
+
+    # Cloud-spend hard wall. <= 0 means unlimited. Checked AGAINST today's
+    # `total_tokens` summed from trace events with a non-Ollama provider, so
+    # an exhausted budget blocks the next cloud call but never local Ollama.
+    daily_token_budget: int = 0
 
     @property
     def effective_embed_provider(self) -> str:
@@ -123,6 +138,22 @@ class LLMClient:
         key = self.config.effective_embed_api_key
         return {"Authorization": f"Bearer {key}"} if key else {}
 
+    def _check_budget(self) -> None:
+        """Raise BudgetExceeded if today's cloud spend has hit the cap.
+
+        Soft boundary — checked before each call, not against the imminent
+        call's tokens (we can't know them yet). One call may push us over,
+        but no further calls go through until the next local-time midnight.
+        """
+        budget = self.config.daily_token_budget
+        if budget <= 0 or self.config.events_path is None:
+            return
+        used = events.sum_cloud_tokens_since(
+            self.config.events_path, events.today_start_ts()
+        )
+        if used >= budget:
+            raise BudgetExceeded(used, budget)
+
     def chat(self, messages: list[dict], *, stream: bool = True):
         """Chat completion. Returns a token iterator if stream else the full string.
 
@@ -130,6 +161,8 @@ class LLMClient:
         completes (immediately for non-stream, after iterator exhaustion for
         stream). It is None if the provider did not return usage.
         """
+        if self._is_cloud(self.config.provider):
+            self._check_budget()
         self._audit("chat", sum(len(m.get("content", "")) for m in messages))
         self.last_usage = None
         if self.config.provider == "anthropic":

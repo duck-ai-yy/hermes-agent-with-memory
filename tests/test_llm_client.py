@@ -8,10 +8,13 @@ provider branches (ollama / openai / anthropic) without the live network.
 from __future__ import annotations
 
 import json
+import time
+from pathlib import Path
 
 import httpx
+import pytest
 
-from mneme.llm.client import LLMClient, LLMConfig
+from mneme.llm.client import BudgetExceeded, LLMClient, LLMConfig
 
 
 def _client_with(handler, embed_handler=None, **cfg_kwargs) -> LLMClient:
@@ -239,3 +242,109 @@ def test_anthropic_chat_splits_system_and_uses_messages_endpoint():
     # The mocked response includes usage; the client should surface it.
     assert client.last_usage.prompt_tokens == 12
     assert client.last_usage.completion_tokens == 4
+
+
+# -- Budget hard-wall -------------------------------------------------------
+
+def _write_events(path: Path, records: list[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def test_budget_blocks_cloud_call_when_today_exhausted(tmp_path):
+    """Pre-call check raises before any HTTP traffic when over budget."""
+    ep = tmp_path / "events.jsonl"
+    _write_events(ep, [
+        {"ts": int(time.time()), "kind": "trace", "id": "T1",
+         "provider": "openai", "total_tokens": 1500},
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("HTTP must not be called when budget is exhausted")
+
+    client = _client_with(
+        handler, provider="openai", api_key="sk", base_url="https://x",
+        events_path=ep, daily_token_budget=1000,
+    )
+    with pytest.raises(BudgetExceeded) as exc:
+        client.chat([{"role": "user", "content": "hi"}], stream=False)
+    assert exc.value.used == 1500
+    assert exc.value.budget == 1000
+
+
+def test_budget_ignores_ollama_spend(tmp_path):
+    """Local Ollama tokens never count toward the cloud budget."""
+    ep = tmp_path / "events.jsonl"
+    _write_events(ep, [
+        {"ts": int(time.time()), "kind": "trace", "id": "T1",
+         "provider": "ollama", "total_tokens": 99_999},
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+
+    client = _client_with(
+        handler, provider="openai", api_key="sk", base_url="https://x",
+        events_path=ep, daily_token_budget=1000,
+    )
+    reply = client.chat([{"role": "user", "content": "hi"}], stream=False)
+    assert reply == "ok"
+
+
+def test_budget_ignores_yesterday_spend(tmp_path):
+    """Spend from before today's local midnight does not carry over."""
+    ep = tmp_path / "events.jsonl"
+    _write_events(ep, [
+        {"ts": int(time.time()) - 86400 * 2, "kind": "trace", "id": "T1",
+         "provider": "openai", "total_tokens": 9999},
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}], "usage": {},
+        })
+
+    client = _client_with(
+        handler, provider="openai", api_key="sk", base_url="https://x",
+        events_path=ep, daily_token_budget=1000,
+    )
+    reply = client.chat([{"role": "user", "content": "hi"}], stream=False)
+    assert reply == "ok"
+
+
+def test_budget_never_blocks_local_ollama_calls(tmp_path):
+    """Ollama is free; even with budget=1 and huge prior spend it must work."""
+    ep = tmp_path / "events.jsonl"
+    _write_events(ep, [
+        {"ts": int(time.time()), "kind": "trace", "id": "T1",
+         "provider": "openai", "total_tokens": 999_999},
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message": {"content": "ok"}, "done": True})
+
+    client = _client_with(
+        handler, provider="ollama",
+        events_path=ep, daily_token_budget=1,
+    )
+    reply = client.chat([{"role": "user", "content": "hi"}], stream=False)
+    assert reply == "ok"
+
+
+def test_budget_zero_means_unlimited(tmp_path):
+    """budget <= 0 is the explicit 'no cap' value; no events lookup happens."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "ok"}}], "usage": {},
+        })
+
+    client = _client_with(
+        handler, provider="openai", api_key="sk", base_url="https://x",
+        # No events_path, no budget — must not raise looking for it.
+    )
+    reply = client.chat([{"role": "user", "content": "hi"}], stream=False)
+    assert reply == "ok"

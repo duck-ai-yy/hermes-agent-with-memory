@@ -20,7 +20,7 @@ from . import paths
 from .agent import respond_stream
 from .ids import ulid
 from .llm import client as _llm
-from .llm.client import LLMConfig, configure
+from .llm.client import BudgetExceeded, LLMConfig, configure
 from .memory import forget as forget_mod
 from .memory import store
 from .trace import events
@@ -44,7 +44,19 @@ _ENV_FIELDS = {
 def _configure_llm() -> None:
     """Build the singleton LLM client; env vars override Ollama defaults."""
     overrides = {f: v for env, f in _ENV_FIELDS.items() if (v := os.environ.get(env))}
-    configure(LLMConfig(events_path=paths.EVENTS_PATH, **overrides))
+    configure(LLMConfig(
+        events_path=paths.EVENTS_PATH,
+        daily_token_budget=_budget_from_env(),
+        **overrides,
+    ))
+
+
+def _budget_from_env() -> int:
+    """Parse MNEME_DAILY_TOKEN_BUDGET; non-int or unset means unlimited."""
+    try:
+        return int(os.environ.get("MNEME_DAILY_TOKEN_BUDGET", "0"))
+    except ValueError:
+        return 0
 
 
 def _open_db():
@@ -125,6 +137,10 @@ def chat() -> None:
 
         try:
             reply = _stream_to_stdout(line, turn_id, cx)
+        except BudgetExceeded as exc:
+            typer.secho(f"\nbudget: {exc} — set MNEME_DAILY_TOKEN_BUDGET higher "
+                        "or switch to local Ollama", fg=typer.colors.YELLOW)
+            continue
         except Exception as exc:  # provider down, etc.
             typer.secho(f"\nerror: {exc}", fg=typer.colors.RED)
             continue
@@ -207,6 +223,12 @@ def stats() -> None:
         f"tokens   in: {totals['prompt']:,}  out: {totals['completion']:,}  "
         f"total: {totals['total']:,}"
     )
+    today = events.sum_cloud_tokens_since(paths.EVENTS_PATH, events.today_start_ts())
+    budget = _budget_from_env()
+    if budget > 0:
+        typer.echo(f"today    {today:,} / {budget:,} cloud tokens")
+    else:
+        typer.echo(f"today    {today:,} cloud tokens (no budget)")
 
 
 def _token_totals(events_path) -> dict:
