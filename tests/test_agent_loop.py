@@ -588,7 +588,7 @@ def test_unknown_tool_name_returns_unknowntool_block(
 
 
 def test_shell_argument_error_when_command_not_string(
-    cx, fake_llm, tmp_path,
+    cx, fake_llm, tmp_path, monkeypatch,
 ):
     """B7-int: if the LLM passes a non-string command (e.g. dict), surface
     ArgumentError without invoking shell.execute. (Pure unit in
@@ -599,8 +599,9 @@ def test_shell_argument_error_when_command_not_string(
         called["n"] += 1
         raise AssertionError("shell.execute must not be called for bad args")
 
-    import mneme.agent as _agent
-    _agent.shell_tool.execute  # noqa
+    # Actually wire the guard — without this monkeypatch the `called` counter
+    # is dead code (lead e2e finding).
+    monkeypatch.setattr("mneme.agent.shell_tool.execute", must_not_run)
     fake_llm.tool_call_script = [
         {"text": "",
          "tool_calls": [ToolCall(id="c1", name="shell",
@@ -608,9 +609,6 @@ def test_shell_argument_error_when_command_not_string(
          "stop_reason": "tool_use"},
         {"text": "noted error", "tool_calls": [], "stop_reason": "end_turn"},
     ]
-    # Monkeypatch defensively — if execute IS called, the test fails clean.
-    import pytest as _pt
-    _ = _pt
     reply = agent.respond("bad args", "turn1", cx, confirm_cb=_accept)
     assert reply.text == "noted error"
 
@@ -619,6 +617,54 @@ def test_shell_argument_error_when_command_not_string(
     assert len(tool_msgs) == 1
     assert tool_msgs[0]["content"].startswith("ArgumentError:")
     assert called["n"] == 0  # execute never reached
+
+
+# -- B18-bis: events.jsonl never contains stdout/stderr CONTENT (only bytes)
+
+
+def test_events_jsonl_redacts_stdout_content_even_for_5kb_outputs(
+    cx, fake_llm, tmp_path, monkeypatch,
+):
+    """Privacy invariant: kind=tool_result events must record stdout_bytes
+    metadata only, never the raw stdout string. Lead e2e caught that the
+    previous B18 test was actually `client.config` immutability — the
+    no-leak invariant was unverified. Mutation guard for any future
+    refactor that accidentally inlines stdout into the audit event."""
+    distinctive = "X" * 5_000   # 5 KB of a recognizable character
+
+    class _BigStdout:
+        def __init__(self, command):
+            self.command = command
+            self.exit_code = 0
+            self.stdout = distinctive
+            self.stderr = ""
+            self.stdout_bytes = 5_000
+            self.stderr_bytes = 0
+            self.truncated = False
+            self.duration_ms = 1
+
+    monkeypatch.setattr("mneme.agent.shell_tool.execute",
+                        lambda cmd, **kw: _BigStdout(cmd))
+    fake_llm.tool_call_script = [
+        {"text": "",
+         "tool_calls": [ToolCall(id="b1", name="shell",
+                                 arguments={"command": "big"})],
+         "stop_reason": "tool_use"},
+        {"text": "done", "tool_calls": [], "stop_reason": "end_turn"},
+    ]
+    agent.respond("read big", "turn1", cx, confirm_cb=_accept)
+
+    raw = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    # No chunk of distinctive content leaks. Even a 200-char run would be a
+    # privacy fail — pin a strict substring.
+    assert "X" * 200 not in raw, "stdout content leaked into events.jsonl"
+    # Metadata IS recorded (this is the positive half of the assertion).
+    tool_result_events = [
+        json.loads(line) for line in raw.splitlines() if line.strip()
+        and '"kind": "tool_result"' in line and "stdout_bytes" in line
+    ]
+    assert len(tool_result_events) == 1
+    assert tool_result_events[0]["stdout_bytes"] == 5_000
 
 
 # -- mini shell-result stubs used by the tests above -----------------------

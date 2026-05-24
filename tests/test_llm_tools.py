@@ -297,6 +297,74 @@ def test_openai_round_trip_uses_role_tool_with_tool_call_id():
     # via the content. The presence of tool_call_id is the pairing key.
 
 
+# -- HW4: streaming + tools forces stream=False end-to-end in M1 ------------
+
+
+def test_streaming_request_with_tools_forces_stream_false_on_the_wire_ollama():
+    """HW4 (architect §3, M1 scope): when tools are declared the client must
+    force stream=False on the outbound HTTP request — partial JSON parsing
+    for tool_call deltas is M2 work. Removing the guard at client.py:218
+    used to pass the suite (lead e2e gap)."""
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={
+            "message": {"content": "ok", "tool_calls": []}, "done": True,
+        })
+
+    client = _client_with(handler, provider="ollama", chat_model="qwen2.5:7b")
+    # Caller asks for stream=True; client MUST downgrade to non-stream.
+    msg = client.chat(
+        [{"role": "user", "content": "x"}], stream=True,
+        tools=[{"type": "function", "function": {"name": "shell"}}],
+    )
+    assert seen["body"]["stream"] is False
+    # And the return type is an AssistantMessage (not an Iterator).
+    assert isinstance(msg, AssistantMessage)
+
+
+def test_streaming_request_with_tools_forces_stream_false_on_the_wire_openai():
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {"content": "ok", "tool_calls": []},
+                "finish_reason": "stop",
+            }],
+        })
+
+    client = _client_with(handler, provider="openai", chat_model="gpt-4o-mini",
+                          base_url="https://api.openai.com")
+    msg = client.chat(
+        [{"role": "user", "content": "x"}], stream=True,
+        tools=[{"type": "function", "function": {"name": "shell"}}],
+    )
+    assert seen["body"]["stream"] is False
+    assert isinstance(msg, AssistantMessage)
+
+
+def test_streaming_request_with_tools_forces_stream_false_on_the_wire_anthropic():
+    seen: dict = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+        })
+
+    client = _client_with(handler, provider="anthropic", chat_model="claude-x")
+    msg = client.chat(
+        [{"role": "user", "content": "x"}], stream=True,
+        tools=[{"name": "shell", "description": "x", "input_schema": {}}],
+    )
+    assert seen["body"]["stream"] is False
+    assert isinstance(msg, AssistantMessage)
+
+
 def test_ollama_round_trip_uses_role_tool_with_tool_name_only():
     """HW3: Ollama pairs results by tool_name, not tool_call_id. Mutation
     guard: a refactor that adds tool_call_id to Ollama's tool message would
