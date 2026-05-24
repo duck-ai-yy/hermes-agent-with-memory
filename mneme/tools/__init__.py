@@ -10,3 +10,4 @@ ships-with-mneme tools are loaded; the agent loop talks only to
 from . import shell  # noqa: F401
 from . import file_read  # noqa: F401
 from . import web_fetch  # noqa: F401
+from . import python_exec  # noqa: F401
