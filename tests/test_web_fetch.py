@@ -272,7 +272,11 @@ def test_R_WF_1_redirect_followed_and_final_body_returned(
 def test_R_WF_2_too_many_redirects_returns_specific_error(
     mock_httpx, mock_getaddrinfo,
 ):
-    """A redirect chain of MAX_REDIRECTS+1 length -> 'too many redirects'."""
+    """A redirect chain of MAX_REDIRECTS+1 length -> 'too many redirects'.
+    The literal cap is pinned at 10 (ratchet against M12 = "cap relaxed
+    to a huge value would let an attacker hammer infinitely"). Asserting
+    the literal 10 catches the mutation; asserting str(wf_mod.MAX_REDIRECTS)
+    would silently track whatever the module says."""
     mock_getaddrinfo.set("example.com", PUB_ADDR)
 
     def redirect_loop(req):
@@ -283,7 +287,9 @@ def test_R_WF_2_too_many_redirects_returns_specific_error(
     assert tr.is_error is True
     assert tr.audit["error"] == "TooManyRedirects"
     assert "too many redirects" in tr.content
-    assert str(wf_mod.MAX_REDIRECTS) in tr.content
+    # Literal-pin the cap (mutation guard for M12).
+    assert wf_mod.MAX_REDIRECTS == 10
+    assert "(>10)" in tr.content
 
 
 # -- R-WF-3: redirect target re-SSRF — private IP at hop 2 blocked --------

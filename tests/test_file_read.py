@@ -71,16 +71,21 @@ def test_C2_max_bytes_arg_truncates_with_marker_literal(tmp_path, monkeypatch):
 
 
 def test_C3_max_bytes_above_hard_ceiling_is_silently_clamped(tmp_path, monkeypatch):
-    """A model asking for max_bytes=10**9 must NOT make us malloc a GB.
-    The hard ceiling is 256 KB (262144). Caller asks for 10**9; effective
-    cap is 262144. The file is small enough to fit, so no truncation."""
+    """A model asking for max_bytes=10**9 against a LARGE file (1 MB) must
+    cap at 256 KB. Mutation guard for M7: `cap = max_bytes` without the
+    min() clamp would let the model balloon memory. Test forces the
+    distinction by making the file genuinely bigger than the hard cap."""
     monkeypatch.chdir(tmp_path)
-    payload = "Z" * 1000
-    p = _write(tmp_path / "small.txt", payload)
+    # 1 MB file; hard cap is 256 KB.
+    payload = "Z" * (1024 * 1024)
+    p = _write(tmp_path / "huge.txt", payload)
     tr = execute("file_read", {"path": str(p), "max_bytes": 10**9})
     assert tr.is_error is False
-    assert tr.content == payload
-    assert tr.audit["truncated"] is False
+    # The hard 256 KB cap fires: content body trimmed to 256 KB + marker.
+    assert tr.audit["truncated"] is True
+    assert tr.audit["bytes_read"] == 256 * 1024
+    # The truncation marker reports the REAL file size, not the cap.
+    assert f"[file truncated, {1024 * 1024} bytes total]" in tr.content
     assert fr_mod.MAX_FILE_BYTES == 256 * 1024
 
 
