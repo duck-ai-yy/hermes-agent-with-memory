@@ -81,3 +81,63 @@ def test_respond_with_confirm_cb_none_does_not_write_tool_audit_events(
     text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
     assert "tool_audit" not in text
     assert "tool_result" not in text
+
+
+# ============================================================================
+# v0.9 / M2: server passes allowed_tools=[] explicitly when wiring respond
+# ============================================================================
+#
+# v0.9 step 7 (1a26a4f) changed server.py to pass `allowed_tools=[]` on every
+# respond() call. Combined with confirm_cb=None, this is a belt-and-braces
+# guarantee that the HTTP path never exposes tools — even if a refactor
+# later flipped one of the guards.
+
+
+def test_E7_server_path_with_allowed_tools_empty_does_not_call_registry(
+    cx, fake_llm,
+):
+    """E7: respond(allowed_tools=[]) must pass tools=None on the wire, even
+    when confirm_cb is set. The combined guard is what HTTP /chat relies on
+    (no-confirm + empty-allow). Pin both branches: tools=None AND no
+    tool_call_script consumption."""
+    fake_llm.tool_call_script = [
+        {"text": "would call",
+         "tool_calls": [ToolCall(id="t1", name="shell",
+                                 arguments={"command": "ls"})],
+         "stop_reason": "tool_use"},
+    ]
+    # confirm_cb provided BUT allowed_tools=[] -> no-tools path.
+    agent.respond("hi", "turn1", cx, confirm_cb=_accept_anything,
+                  allowed_tools=[])
+    # Tools=None on the wire.
+    agent_tools = [
+        t for t, msgs in zip(fake_llm.tools_seen, fake_llm.messages_seen)
+        if msgs and "STRICT JSON" not in (msgs[0].get("content") or "")
+    ]
+    assert agent_tools == [None]
+    # Scripted call NOT consumed.
+    assert len(fake_llm.tool_call_script) == 1
+
+
+def test_D11_server_chat_path_respects_confirm_cb_none_even_with_subset(
+    cx, fake_llm,
+):
+    """D11 (server angle): even if a caller passes allowed_tools=['shell']
+    BUT confirm_cb is None, the result must still be no-tools — because
+    there is no UI for confirmation. Belt-and-braces: confirm_cb=None
+    drives `use_tools=False` regardless of allowed_tools."""
+    fake_llm.tool_call_script = [
+        {"text": "ghost",
+         "tool_calls": [ToolCall(id="t1", name="shell",
+                                 arguments={"command": "ls"})],
+         "stop_reason": "tool_use"},
+    ]
+    agent.respond("hi", "turn1", cx, confirm_cb=None,
+                  allowed_tools=["shell"])
+    agent_tools = [
+        t for t, msgs in zip(fake_llm.tools_seen, fake_llm.messages_seen)
+        if msgs and "STRICT JSON" not in (msgs[0].get("content") or "")
+    ]
+    assert agent_tools == [None]
+    # Tool script never consumed.
+    assert len(fake_llm.tool_call_script) == 1
