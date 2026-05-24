@@ -28,31 +28,6 @@ STDERR_LIMIT = 4 * 1024
 # and we report it cleanly rather than hang the agent loop.
 DEFAULT_TIMEOUT = 30.0
 
-# Legacy SCHEMA literal kept ONLY through step 2 of the v0.9 migration so the
-# agent loop (still calling _tool_schemas_for_provider) stays green between
-# steps. Step 6 deletes this — the registry derives the schema from the
-# @tool-decorated `shell()` wrapper below.
-SCHEMA: dict = {
-    "name": "shell",
-    "description": (
-        "Execute a shell command on the user's local machine. Returns stdout, "
-        "stderr, and the exit code. Use for reading files, listing directories, "
-        "or any non-destructive inspection. Every call requires user "
-        "confirmation, so prefer one well-formed command over many."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "The shell command to execute (passed to /bin/sh -c).",
-            },
-        },
-        "required": ["command"],
-    },
-}
-
-
 @dataclass(frozen=True)
 class ShellResult:
     """Result of one `shell` invocation. Carries the *raw* stdout/stderr
@@ -153,7 +128,19 @@ def shell(command: str) -> ToolResult:
     Args:
         command: The shell command to execute (passed to /bin/sh -c).
     """  # noqa: E501
-    result = execute(command)
+    # `execute` is documented as "never raises" but the v0.8 agent.py wrapped
+    # it in try/except to preserve a "ShellError: <Type>: <msg>" prefix
+    # against test-time monkeypatching. Keep that exact contract here so
+    # the registry's generic catch-all never sees a shell error first.
+    try:
+        result = execute(command)
+    except Exception as exc:
+        msg = f"ShellError: {type(exc).__name__}: {exc}"
+        return ToolResult(
+            content=msg,
+            is_error=True,
+            audit={"error": type(exc).__name__, "exit_code": None},
+        )
     content = format_for_llm(result)
     return ToolResult(
         content=content,

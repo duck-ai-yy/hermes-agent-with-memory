@@ -28,7 +28,10 @@ from .llm import client as _llm
 from .llm import pricing
 from .llm.client import AssistantMessage, ToolCall, Usage
 from .memory import ingest, retrieve, store
-from .tools import shell as shell_tool
+# Importing the tools package triggers each @tool registration at startup.
+from . import tools as _tools  # noqa: F401
+from .tools import registry as tool_registry
+from .tools import shell as shell_tool  # noqa: F401  # kept for test monkeypatch path
 from .trace import events
 
 # Permissive on purpose: catches fabricated tags too, not just well-formed ULIDs.
@@ -90,31 +93,8 @@ def build_prompt(user_text: str, slices: list, blueprint: str) -> tuple[str, str
     return stable_prefix, f"{header}\n{body}\n\nUSER: {user_text}"
 
 
-# -- Tool schema declarations the loop sends to the LLM --------------------
-
-def _tool_schemas_for_provider(provider: str) -> list[dict]:
-    """Wrap shell_tool.SCHEMA in the request shape each provider expects.
-
-    Anthropic takes the schema flat under `tools=[]`; OpenAI/Ollama nest it
-    under `{type:"function", function:{...}}`. See
-    docs/knowledge/provider-tool-calling.md §1.
-    """
-    s = shell_tool.SCHEMA
-    if provider == "anthropic":
-        return [{
-            "name": s["name"],
-            "description": s["description"],
-            "input_schema": s["input_schema"],
-        }]
-    # OpenAI / Ollama function shape
-    return [{
-        "type": "function",
-        "function": {
-            "name": s["name"],
-            "description": s["description"],
-            "parameters": s["input_schema"],
-        },
-    }]
+# -- Tool schema declarations -------------------------------------------
+# v0.9: registry.schemas_for_provider replaces the v0.8 hardcoded wrapper.
 
 
 # -- Turn open / close (unchanged structurally from v0.7) ------------------
@@ -226,9 +206,10 @@ def _run_tool_call(
 ) -> tuple[dict, bool]:
     """Run one tool call with audit + confirm. Return (tool_result_block, ran).
 
-    `tool_result_block` is the dict to feed back to the LLM (provider-agnostic
-    representation; the message-builder below wraps it per provider). `ran`
-    is True iff the tool actually executed (False on rejection).
+    v0.9: dispatch is via `tool_registry.execute(name, args)`; the agent
+    layer keeps confirm + audit (the layering invariant from v0.8 — tools
+    themselves never touch events.jsonl). `ran` is True iff the tool was
+    actually invoked (False on rejection).
     """
     args = tc.arguments or {}
     # Audit the *pending* decision so a crash between confirm and execute
@@ -260,59 +241,34 @@ def _run_tool_call(
                       tool=tc.name, decision="accepted",
                       tool_call_id=tc.id)
 
-    # M1 has exactly one tool. v0.9 will look this up in a registry.
-    if tc.name != "shell":
-        # Surface the error type specifically (lessons/developer.md v0.6).
-        content = f"UnknownTool: no tool named {tc.name!r} is registered"
-        if ep is not None:
-            events.append(ep, kind="tool_result", trace_id=trace_id,
-                          tool=tc.name, tool_call_id=tc.id,
-                          error="UnknownTool", exit_code=None)
-        return {
-            "tool_call_id": tc.id, "tool_name": tc.name,
-            "content": content, "is_error": True,
-        }, True
+    # Dispatch through the registry. ToolResult is "never raises" by
+    # contract — registry.execute catches any leak and reports the type.
+    tr = tool_registry.execute(tc.name, args)
 
-    command = args.get("command")
-    if not isinstance(command, str):
-        msg = f"ArgumentError: shell.command must be a string, got {type(command).__name__}"
-        if ep is not None:
-            events.append(ep, kind="tool_result", trace_id=trace_id,
-                          tool=tc.name, tool_call_id=tc.id,
-                          error="ArgumentError", exit_code=None)
-        return {
-            "tool_call_id": tc.id, "tool_name": tc.name,
-            "content": msg, "is_error": True,
-        }, True
-
-    try:
-        result = shell_tool.execute(command)
-    except Exception as exc:
-        # shell.execute is "never raises" by contract, but defend in depth:
-        # any leak is reported with its exact error type, not "unknown error".
-        msg = f"ShellError: {type(exc).__name__}: {exc}"
-        if ep is not None:
-            events.append(ep, kind="tool_result", trace_id=trace_id,
-                          tool=tc.name, tool_call_id=tc.id,
-                          error=type(exc).__name__, exit_code=None)
-        return {
-            "tool_call_id": tc.id, "tool_name": tc.name,
-            "content": msg, "is_error": True,
-        }, True
-
-    content = shell_tool.format_for_llm(result)
+    # Build the per-tool tool_result event. Audit fields the tool reports
+    # in `tr.audit` are merged flat into the event (design §6). Error-only
+    # results carry exit_code=None to match the v0.8 schema.
     if ep is not None:
-        events.append(ep, kind="tool_result", trace_id=trace_id,
-                      tool=tc.name, tool_call_id=tc.id,
-                      exit_code=result.exit_code,
-                      stdout_bytes=result.stdout_bytes,
-                      stderr_bytes=result.stderr_bytes,
-                      truncated=result.truncated,
-                      duration_ms=result.duration_ms)
+        event_kwargs: dict = {
+            "trace_id": trace_id,
+            "tool": tc.name,
+            "tool_call_id": tc.id,
+        }
+        err = tr.audit.get("error")
+        if err is not None:
+            event_kwargs["error"] = err
+            event_kwargs["exit_code"] = tr.audit.get("exit_code")
+        # Merge audit fields (excluding the error tag — already handled).
+        for k, v in tr.audit.items():
+            if k == "error":
+                continue
+            event_kwargs[k] = v
+        events.append(ep, kind="tool_result", **event_kwargs)
+
     return {
         "tool_call_id": tc.id, "tool_name": tc.name,
-        "content": content,
-        "is_error": result.exit_code != 0,
+        "content": tr.content,
+        "is_error": tr.is_error,
     }, True
 
 
@@ -401,20 +357,29 @@ def _agent_loop(
     confirm_cb: ConfirmCb | None,
     *,
     on_intermediate_text: Callable[[str], None] | None = None,
+    allowed_tools: list[str] | None = None,
 ):
     """Drive the LLM <-> tool conversation. Return (reply_text, totals dict).
 
     totals = {usage, cost, had_unknown_price, iters, tool_calls, tool_rejects}.
+    `allowed_tools=None` exposes every registered tool; `[]` exposes none;
+    a list of names exposes that subset (registry filters by name).
     """
     messages: list[dict] = [
         {"role": "system", "content": prefix},
         {"role": "user", "content": suffix},
     ]
     provider = client.config.provider
-    # If no confirm callback (e.g. HTTP /chat in M1), degrade to no tools —
-    # equivalent to the v0.7 single-call path, no surprises.
-    use_tools = confirm_cb is not None
-    tools = _tool_schemas_for_provider(provider) if use_tools else None
+    # If no confirm callback (e.g. HTTP /chat), degrade to no tools — same
+    # as v0.7 single-call path. allowed_tools=[] (explicit empty) also
+    # short-circuits to no-tools so the loop avoids an empty tools[] payload.
+    use_tools = confirm_cb is not None and (
+        allowed_tools is None or len(allowed_tools) > 0
+    )
+    tools = (
+        tool_registry.schemas_for_provider(provider, allow=allowed_tools)
+        if use_tools else None
+    )
 
     running_usage: Usage | None = None
     running_cost = 0.0
@@ -500,17 +465,23 @@ def respond(
     *,
     confirm_cb: ConfirmCb | None = None,
     on_intermediate_text: Callable[[str], None] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> Reply:
     """Run one full chat turn (non-streaming).
 
     `confirm_cb` enables tool use: when not None, the LLM may request tool
     calls; each call goes through the callback for y/N before executing.
     When None, behavior is byte-identical to v0.7's single-call path.
+
+    `allowed_tools` filters the registry: None = every registered tool,
+    [] = no tools (server uses this; agent loop degrades to no-tool path),
+    a list of names = exactly that subset.
     """
     slices, prefix, suffix, trace_id, client, ep = _open_turn(user_text, turn_id, cx)
     reply_text, totals = _agent_loop(
         prefix, suffix, client, ep, trace_id, confirm_cb,
         on_intermediate_text=on_intermediate_text,
+        allowed_tools=allowed_tools,
     )
     return _close_turn(
         reply_text, slices, trace_id, client, ep, turn_id, cx,
@@ -530,6 +501,7 @@ def respond_stream(
     *,
     confirm_cb: ConfirmCb | None = None,
     on_intermediate_text: Callable[[str], None] | None = None,
+    allowed_tools: list[str] | None = None,
 ) -> Iterator[str]:
     """Streaming variant: yields text chunks; returns the Reply via
     StopIteration.value once the iterator is exhausted.
@@ -570,6 +542,7 @@ def respond_stream(
     reply_text, totals = _agent_loop(
         prefix, suffix, client, ep, trace_id, confirm_cb,
         on_intermediate_text=on_intermediate_text,
+        allowed_tools=allowed_tools,
     )
     if reply_text:
         yield reply_text
