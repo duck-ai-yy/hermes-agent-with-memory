@@ -183,22 +183,11 @@ def test_search_k_at_sqlite_vec_max_works(runner, home_db, fake_llm):
     assert "only row" in result.stdout
 
 
-@pytest.mark.xfail(
-    reason=(
-        "BUG v0.6: -k > 4096 raises sqlite3.OperationalError from sqlite-vec "
-        "('k value in knn query too large'), which the `except Exception` "
-        "block mislabels as 'embed provider unreachable' and exits 1. "
-        "Expected: clamp k to the index ceiling and succeed, OR fail with a "
-        "k-specific message ('-k must be ≤ 4096')."
-    ),
-    strict=True,
-)
 def test_search_k_huge_does_not_crash(runner, home_db, fake_llm):
     """`-k` far exceeding the vector-index ceiling must clamp gracefully.
 
-    A naive user typing `-k 10000` should not see a misleading
-    'embed provider unreachable' error — the embedder is fine; the index
-    rejected the query parameter.
+    Fixed in v0.6 by clamping k to _VEC_K_MAX inside recall(); a naive user
+    typing `-k 10000` now just sees their hits, not a misleading error.
     """
     ingest.save_user_message("only row", "turn1", home_db)
     home_db.commit()

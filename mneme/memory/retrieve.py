@@ -17,6 +17,7 @@ from .embed import embed
 _VEC_WEIGHT = 0.7
 _GRAPH_WEIGHT = 0.3
 _CHAR_BUDGET = 6000
+_VEC_K_MAX = 4096          # sqlite-vec MATCH ceiling; larger k raises OperationalError
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ def recall(
     treats the turn as a repeat).
     """
     exclude = exclude or set()
+    k = min(max(0, k), _VEC_K_MAX)
     qvec = embed(query, cx)
 
     vec_rows = cx.execute(
