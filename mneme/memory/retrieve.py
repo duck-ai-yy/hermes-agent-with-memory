@@ -17,6 +17,7 @@ from .embed import embed
 _VEC_WEIGHT = 0.7
 _GRAPH_WEIGHT = 0.3
 _CHAR_BUDGET = 6000
+_VEC_K_MAX = 4096          # sqlite-vec MATCH ceiling; larger k raises OperationalError
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class Slice:
     role: str
     text: str
     created_at: int
+    score: float = 0.0
 
 
 class _GraphDB:
@@ -53,6 +55,7 @@ def recall(
     treats the turn as a repeat).
     """
     exclude = exclude or set()
+    k = min(max(0, k), _VEC_K_MAX)
     qvec = embed(query, cx)
 
     vec_rows = cx.execute(
@@ -91,7 +94,7 @@ def recall(
 
     result: list[Slice] = []
     budget = _CHAR_BUDGET
-    for _, sid in scored:
+    for neg_score, sid in scored:
         if sid in exclude:
             continue
         row = cx.execute(
@@ -102,5 +105,5 @@ def recall(
         if result and budget - len(row[2]) < 0:
             break
         budget -= len(row[2])
-        result.append(Slice(row[0], row[1], row[2], row[3]))
+        result.append(Slice(row[0], row[1], row[2], row[3], -neg_score))
     return result

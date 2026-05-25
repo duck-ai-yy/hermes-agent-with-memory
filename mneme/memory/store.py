@@ -29,13 +29,40 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def init_db(cx: sqlite3.Connection) -> None:
-    """Apply schema.sql and create the vec0 virtual table (idempotent)."""
+    """Apply schema.sql and create the vec0 virtual table (idempotent).
+
+    v0.10 adds a `session_id` column to `slices` (groups turns into chat
+    sessions). For pre-v0.10 databases the migration here detects the missing
+    column, ALTERs it in, and back-fills `session_id := turn_id` so every
+    historical slice falls into a self-contained one-turn session. The
+    `WHERE session_id IS NULL` guard makes the UPDATE idempotent — re-running
+    init_db on a partially-migrated DB never overwrites real session ids.
+    """
     cx.executescript(_SCHEMA.read_text())
     cx.execute(
         f"CREATE VIRTUAL TABLE IF NOT EXISTS vec_slices "
         f"USING vec0(slice_id TEXT PRIMARY KEY, embedding FLOAT[{_EMBED_DIM}])"
     )
+    _migrate_slices_session_id(cx)
     cx.commit()
+
+
+def _migrate_slices_session_id(cx: sqlite3.Connection) -> None:
+    """v0.10 migration: add slices.session_id + idx_slices_session, back-fill
+    from turn_id. Idempotent — safe to re-run on a fresh or already-migrated
+    DB."""
+    columns = {row[1] for row in cx.execute("PRAGMA table_info(slices)")}
+    if "session_id" not in columns:
+        cx.execute("ALTER TABLE slices ADD COLUMN session_id TEXT")
+    # WHERE-IS-NULL guard: only back-fill rows that have never carried a
+    # session_id. Re-running this on already-populated data must not stomp
+    # real session ids.
+    cx.execute(
+        "UPDATE slices SET session_id = turn_id WHERE session_id IS NULL"
+    )
+    cx.execute(
+        "CREATE INDEX IF NOT EXISTS idx_slices_session ON slices(session_id)"
+    )
 
 
 @contextmanager

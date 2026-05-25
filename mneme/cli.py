@@ -7,19 +7,23 @@ In-process and ephemeral: a command runs and exits. Only `serve` is long-lived.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 import time
 
 import httpx
 import typer
 
 from . import paths
-from .agent import respond
+from .agent import respond_stream
 from .ids import ulid
-from .llm.client import LLMConfig, configure
+from .llm import client as _llm
+from .llm import pricing
+from .llm.client import BudgetExceeded, LLMConfig, configure
 from .memory import forget as forget_mod
-from .memory import store
+from .memory import retrieve, store
 from .trace import events
 
 app = typer.Typer(add_completion=False, help="Local-first chat agent with memory.")
@@ -41,7 +45,19 @@ _ENV_FIELDS = {
 def _configure_llm() -> None:
     """Build the singleton LLM client; env vars override Ollama defaults."""
     overrides = {f: v for env, f in _ENV_FIELDS.items() if (v := os.environ.get(env))}
-    configure(LLMConfig(events_path=paths.EVENTS_PATH, **overrides))
+    configure(LLMConfig(
+        events_path=paths.EVENTS_PATH,
+        daily_token_budget=_budget_from_env(),
+        **overrides,
+    ))
+
+
+def _budget_from_env() -> int:
+    """Parse MNEME_DAILY_TOKEN_BUDGET; non-int or unset means unlimited."""
+    try:
+        return int(os.environ.get("MNEME_DAILY_TOKEN_BUDGET", "0"))
+    except ValueError:
+        return 0
 
 
 def _open_db():
@@ -91,11 +107,37 @@ def init() -> None:
 
 
 @app.command()
-def chat() -> None:
-    """Interactive REPL. Slash commands: /explain, /forget <id>, /quit."""
+def chat(
+    resume: str = typer.Option(
+        None, "--resume", help="Resume an existing session by its ULID.",
+    ),
+) -> None:
+    """Interactive REPL. Slash commands: /explain, /forget <id>, /quit.
+
+    v0.10: every `mneme chat` invocation lives in a session (a ULID that
+    groups its turns). Pass `--resume <id>` to continue an existing
+    session — the id must match a session already on disk; otherwise the
+    CLI exits with code 1.
+    """
     _configure_llm()
     cx = _open_db()
-    turn_id = ulid()
+    if resume is not None:
+        row = cx.execute(
+            "SELECT 1 FROM slices WHERE session_id = ? LIMIT 1", (resume,),
+        ).fetchone()
+        if row is None:
+            cx.close()
+            typer.secho(
+                f"SessionNotFound: no session '{resume}'", fg=typer.colors.RED,
+            )
+            raise typer.Exit(1)
+        session_id = resume
+    else:
+        session_id = ulid()
+    # Track whether we've already shown the full session id this run; the
+    # first turn echoes the full 26-char ULID, later turns shrink to an
+    # ellipsis + last 4 chars to keep the footer compact.
+    session_shown = False
     last_trace: str | None = None
     typer.echo("mneme chat — /quit to exit, /forget <id>, /explain [<id>]")
 
@@ -120,18 +162,151 @@ def chat() -> None:
                 typer.echo("nothing to explain yet")
             continue
 
+        # v0.10: a fresh turn_id per user input. Pre-v0.10 the REPL reused
+        # one turn_id for the whole process, conflating turn and session;
+        # the new session_id now plays that role.
+        turn_id = ulid()
         try:
-            reply = respond(line, turn_id, cx)
+            reply = _stream_to_stdout(line, turn_id, cx, session_id=session_id)
+        except BudgetExceeded as exc:
+            typer.secho(f"\nbudget: {exc} — set MNEME_DAILY_TOKEN_BUDGET higher "
+                        "or switch to local Ollama", fg=typer.colors.YELLOW)
+            continue
         except Exception as exc:  # provider down, etc.
-            typer.secho(f"error: {exc}", fg=typer.colors.RED)
+            typer.secho(f"\nerror: {exc}", fg=typer.colors.RED)
             continue
         last_trace = reply.trace_id
-        typer.echo(f"mneme> {reply.text}")
+        client = _llm.get_client()
+        usage = getattr(client, "last_usage", None)
+        tokens_part = f" · tokens: {usage.total_tokens}" if usage else ""
+        cost_part = _cost_footer(client, usage) if usage else ""
+        # `iters` was added to the close-trace in v0.8; surface it in the
+        # footer so the user knows how many LLM calls happened this turn.
+        iters_part = _iters_footer(reply.trace_id)
+        session_part = _session_footer(session_id, session_shown)
+        session_shown = True
         typer.secho(
-            f"       [trace {reply.trace_id} · citations: {reply.citation_quality}]",
+            f"       [trace {reply.trace_id} · citations: "
+            f"{reply.citation_quality}{iters_part}{tokens_part}{cost_part}"
+            f"{session_part}]",
             fg=typer.colors.BRIGHT_BLACK,
         )
     cx.close()
+
+
+def _session_footer(session_id: str, already_shown: bool) -> str:
+    """Return the ` · session …YZ01` (or full-ULID) footer fragment.
+
+    First turn of a session prints the full 26-char ULID so the user can
+    copy it for a future `--resume`. Later turns shrink to U+2026 ellipsis
+    + last 4 chars to keep the footer one line.
+    """
+    if already_shown:
+        return f" · session …{session_id[-4:]}"
+    return f" · session {session_id}"
+
+
+def _iters_footer(trace_id: str) -> str:
+    """Read iters from the just-written close-trace event. Best effort —
+    if the events file is unreadable the footer simply omits the field."""
+    try:
+        record = events.explain(paths.EVENTS_PATH, trace_id)
+    except (KeyError, FileNotFoundError, OSError):
+        return ""
+    iters = record.get("iters")
+    return f" · iters: {iters}" if iters else ""
+
+
+def _cli_confirm_tool(name: str, args: dict) -> bool:
+    """Confirmation callback handed to the agent loop.
+
+    Renders the proposed command short-form, then prompts y/N (default N).
+    Keeping the prompt one-shot: the model already showed any "I'm going
+    to..." text via the intermediate-text callback; this prompt is purely
+    the safety gate.
+    """
+    if name == "shell":
+        cmd = args.get("command", "")
+        typer.secho(f"       [tool] shell: {cmd}", fg=typer.colors.CYAN)
+    else:
+        typer.secho(f"       [tool] {name}: {args}", fg=typer.colors.CYAN)
+    return typer.confirm("       run this command?", default=False)
+
+
+def _print_intermediate(text: str) -> None:
+    """Render an intermediate assistant message (between tool calls).
+
+    Visually distinct from the final `mneme>` reply so the user can tell
+    "what the agent is about to do" from "what the agent finally said".
+    The sentinel format is `       …` (5 leading spaces + ellipsis) on the
+    first line, matching the indent of the footer line.
+    """
+    if not text.strip():
+        return
+    typer.secho(f"       … {text}", fg=typer.colors.BRIGHT_BLACK)
+
+
+def _cost_footer(client, usage) -> str:
+    """Format the ` · $X.XXXX` suffix for the REPL footer.
+
+    Returns `· $?` when the model isn't priced and `· <$0.0001` for sub-cent
+    spend — the user picks "unknown" vs "essentially free" at a glance.
+    Pricing failures degrade silently to `· $?`; they must not break the REPL.
+    """
+    try:
+        cost = pricing.cost_usd(client.config.provider, client.config.chat_model, usage)
+    except Exception:
+        cost = None
+    if cost is None:
+        return " · $?"
+    if 0 < cost < 0.0001:
+        return " · <$0.0001"
+    return f" · ${cost:.4f}"
+
+
+def _stream_to_stdout(user_text: str, turn_id: str, cx, *, session_id: str):
+    """Drive `respond_stream`, printing chunks live; return the final Reply.
+
+    With v0.8 the agent may run a tool mid-turn. Intermediate assistant text
+    ("I'll do X first…") prints on its own indented line BEFORE the confirm
+    prompt; the `mneme> ` header is deferred until the final text starts
+    streaming so it stays adjacent to the last reply (no awkward empty
+    `mneme> ` followed by the tool prompt).
+    """
+    header_printed = False
+
+    def ensure_header() -> None:
+        nonlocal header_printed
+        if not header_printed:
+            sys.stdout.write("mneme> ")
+            sys.stdout.flush()
+            header_printed = True
+
+    gen = respond_stream(
+        user_text, turn_id, cx,
+        session_id=session_id,
+        confirm_cb=_cli_confirm_tool,
+        on_intermediate_text=_print_intermediate,
+        # CLI exposes every registered tool — None lets the registry
+        # decide (v0.9 ships shell / file_read / web_fetch / python_exec).
+        allowed_tools=None,
+    )
+    reply = None
+    while True:
+        try:
+            chunk = next(gen)
+        except StopIteration as stop:
+            reply = stop.value
+            break
+        ensure_header()
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+    # If the turn produced no streamed chunks (e.g. rejection-only path),
+    # still print an empty `mneme>` line so the footer hangs off something.
+    ensure_header()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return reply
 
 
 @app.command()
@@ -170,7 +345,7 @@ def blueprint() -> None:
 
 @app.command()
 def stats() -> None:
-    """Print slice / node / edge counts and database size."""
+    """Print slice / node / edge counts, database size, and lifetime tokens."""
     cx = _open_db()
     for table in ("slices", "nodes", "edges"):
         count = cx.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -178,6 +353,128 @@ def stats() -> None:
     cx.close()
     size = paths.DB_PATH.stat().st_size
     typer.echo(f"db size  {size / 1024:.1f} KiB")
+    totals = _token_totals(paths.EVENTS_PATH)
+    typer.echo(
+        f"tokens   in: {totals['prompt']:,}  out: {totals['completion']:,}  "
+        f"total: {totals['total']:,}"
+    )
+    today_start = events.today_start_ts()
+    today = events.sum_cloud_tokens_since(paths.EVENTS_PATH, today_start)
+    budget = _budget_from_env()
+    if budget > 0:
+        typer.echo(f"today    {today:,} / {budget:,} cloud tokens")
+    else:
+        typer.echo(f"today    {today:,} cloud tokens (no budget)")
+    cost, priced, unpriced = _today_cost_breakdown(paths.EVENTS_PATH, today_start)
+    typer.echo(
+        f"today cost: ${cost:.4f} ({priced} priced, {unpriced} unpriced)"
+    )
+
+
+def _token_totals(events_path) -> dict:
+    """Sum real token counts across all trace events. Missing fields = 0."""
+    totals = {"prompt": 0, "completion": 0, "total": 0}
+    if not events_path.exists():
+        return totals
+    with open(events_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("kind") != "trace":
+                continue
+            totals["prompt"] += rec.get("prompt_tokens", 0)
+            totals["completion"] += rec.get("completion_tokens", 0)
+            totals["total"] += rec.get("total_tokens", 0)
+    return totals
+
+
+def _today_cost_breakdown(events_path, since_ts: int) -> tuple[float, int, int]:
+    """Sum today's logged cost_usd and count priced vs unpriced turn-close traces.
+
+    A "priced" trace = the turn-close event carried `cost_usd` (known model).
+    "Unpriced" = the turn-close event had `total_tokens` but no `cost_usd`
+    (unknown-model path). We sum what was *logged*, never re-pricing from the
+    current table — past turns keep their original cost even if prices drift.
+    """
+    cost = 0.0
+    priced = 0
+    unpriced = 0
+    if not events_path.exists():
+        return cost, priced, unpriced
+    with open(events_path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("kind") != "trace" or rec.get("ts", 0) < since_ts:
+                continue
+            # Only turn-close events carry total_tokens; the pre-call trace
+            # row for the same id has neither tokens nor cost.
+            if "total_tokens" not in rec:
+                continue
+            if "cost_usd" in rec:
+                cost += rec["cost_usd"]
+                priced += 1
+            else:
+                unpriced += 1
+    return cost, priced, unpriced
+
+
+@app.command()
+def search(
+    query: str,
+    k: int = typer.Option(10, "-k", "--k"),
+    hops: int = 2,
+    width: int = 100,
+    full: bool = False,
+) -> None:
+    """Vector + graph search over long-term memory.
+
+    Read-only: never writes slices, vec_slices, or events. May write to
+    embeddings_cache for a novel query — that is the v0.3 cache contract,
+    not a v0.6 side effect.
+    """
+    if not query.strip():
+        typer.echo("empty query")
+        return
+    _configure_llm()
+    cx = _open_db()
+    try:
+        hits = retrieve.recall(query, cx, k=k, hops=hops)
+    except Exception as exc:
+        typer.secho(f"embed provider unreachable: {exc}", fg=typer.colors.RED)
+        cx.close()
+        raise typer.Exit(1)
+    cx.close()
+    _print_hits(hits, query, k, hops, width, full)
+
+
+def _print_hits(hits, query: str, k: int, hops: int, width: int, full: bool) -> None:
+    if not hits:
+        typer.echo(f'no hits · query="{query}" · k={k}')
+        return
+    typer.echo(f"{'score':<6} {'id':<26} {'role':<10} {'when':<16} text")
+    for s in hits:
+        typer.echo(_format_hit(s, width, full))
+    typer.echo(f'{len(hits)} hits · query="{query}" · k={k} · hops={hops}')
+
+
+def _format_hit(s, width: int, full: bool) -> str:
+    width = max(1, width)
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s.created_at))
+    text = s.text.replace("\n", " ⏎ ")
+    if not full and len(text) > width:
+        text = text[:width] + "…"
+    return f"{s.score:.3f}  {s.id:<26} {s.role:<10} {when}  {text}"
 
 
 @app.command()

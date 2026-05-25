@@ -37,6 +37,7 @@ mneme init
 mneme chat                  # 进入对话
 mneme explain <trace_id>    # 溯源某次回复
 mneme forget <slice_id>     # 删除一条记忆（级联边/向量）
+mneme search <query>        # 直接对长期记忆做向量+图检索
 mneme snapshot              # SQLite .backup 到 snapshots/
 mneme blueprint             # $EDITOR 打开系统蓝图
 mneme stats                 # slice/node/edge 数、db 大小
