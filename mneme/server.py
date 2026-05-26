@@ -11,15 +11,17 @@ Helpers live in this module per PRINCIPLE 1 (no new files for ~50 LOC).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import time
 from contextlib import contextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from . import paths
-from .agent import respond
+from .agent import respond, respond_stream
 from .ids import ulid
 from .memory import forget as forget_mod
 from .memory import store
@@ -61,6 +63,127 @@ def _make_sse_frame(event_type: str, data: dict) -> bytes:
     return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
 
 
+# SSE response headers — set together as a single dict per lead phase-1 hint:
+# `Content-Type` is set implicitly via StreamingResponse(media_type=...), but
+# `Cache-Control` and `X-Accel-Buffering` must travel together. The v0.15
+# Feishu webhook adapter will sit behind nginx; `X-Accel-Buffering: no` is
+# the only reliable way to defeat the default proxy buffering.
+_SSE_HEADERS: dict[str, str] = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+}
+
+
+async def _sse_event_stream(
+    user_text: str,
+    turn_id: str,
+    session_id: str,
+    request: Request,
+):
+    """Drive `agent.respond_stream` and yield SSE-framed bytes.
+
+    Sequence (happy path):
+      1. yield `start` frame  ({session_id, turn_id})       -- before LLM call
+      2. for each text chunk yielded by respond_stream:
+           yield `delta` frame ({text})
+      3. on StopIteration, read `.value` (Reply), merge close-trace fields
+         from events.jsonl, yield `done` frame in the pinned insertion order.
+
+    `respond_stream` is a sync generator; every sync call (open cx, pull
+    chunk, read close-trace, close cx) is dispatched onto a single-worker
+    thread executor so they all run on the same OS thread. This keeps the
+    SQLite connection (which is bound to its creation thread) happy without
+    relaxing the default `check_same_thread=True` everywhere else. The
+    executor is owned by this generator and shut down in `finally`.
+    """
+    # Step 1: yield start frame BEFORE touching the LLM (design §3).
+    # The data dict insertion order matches the design literal {session_id,
+    # turn_id} -- session_id first, turn_id second.
+    yield _make_sse_frame("start", {"session_id": session_id, "turn_id": turn_id})
+
+    # One-worker executor pins every sync hop to the same thread so the
+    # SQLite connection (created in that thread) can be reused across hops.
+    loop = asyncio.get_running_loop()
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    async def _run(fn, *args):
+        return await loop.run_in_executor(pool, fn, *args)
+
+    cx = await _run(store.connect, paths.DB_PATH)
+    try:
+        # Build the generator. Calling respond_stream() does NOT execute the
+        # body; it returns a generator object. The body runs on first next().
+        # confirm_cb=None + allowed_tools=[] mirror the v0.10 JSON path
+        # exactly (§7 "tool 仍 closed"). The v0.7 streaming path is hit
+        # because confirm_cb is None.
+        gen = respond_stream(
+            user_text, turn_id, cx,
+            session_id=session_id,
+            confirm_cb=None, allowed_tools=[],
+        )
+
+        reply = None
+        # Use a sentinel to communicate StopIteration from the worker thread:
+        # run_in_executor cannot directly propagate StopIteration.
+        _DONE = object()
+
+        def _pull_next():
+            try:
+                return next(gen)
+            except StopIteration as e:
+                _pull_next.reply = e.value  # type: ignore[attr-defined]
+                return _DONE
+
+        while True:
+            chunk = await _run(_pull_next)
+            if chunk is _DONE:
+                reply = _pull_next.reply  # type: ignore[attr-defined]
+                break
+            # Step 2: one delta frame per text chunk.
+            yield _make_sse_frame("delta", {"text": chunk})
+
+        # Step 3: done frame. The close-trace event was written by
+        # _close_turn inside respond_stream right before StopIteration
+        # fired, so it is already on disk. Reading it back is the cheapest
+        # way to honour the v0.7 boundary 1/2/5 rules (cost / tokens may
+        # be omitted) without duplicating that logic on the HTTP layer.
+        ep = await _run(store.events_path, cx)
+        merged: dict = {}
+        if ep is not None:
+            try:
+                merged = await _run(events.explain, ep, reply.trace_id)
+            except (KeyError, FileNotFoundError):
+                merged = {}
+
+        # Pinned insertion order (design §3): trace_id, citation_quality,
+        # session_id, [cost_usd], [prompt_tokens], [completion_tokens],
+        # [total_tokens], iters. The optional token / cost fields are
+        # only included when the close-trace event itself recorded them
+        # (mirrors v0.7 boundary 1/2/5 exactly).
+        done_data: dict = {
+            "trace_id": reply.trace_id,
+            "citation_quality": reply.citation_quality,
+            "session_id": session_id,
+        }
+        if "cost_usd" in merged:
+            done_data["cost_usd"] = merged["cost_usd"]
+        if "prompt_tokens" in merged:
+            done_data["prompt_tokens"] = merged["prompt_tokens"]
+        if "completion_tokens" in merged:
+            done_data["completion_tokens"] = merged["completion_tokens"]
+        if "total_tokens" in merged:
+            done_data["total_tokens"] = merged["total_tokens"]
+        # iters is always recorded in the close-trace (mneme/agent.py:173).
+        done_data["iters"] = merged.get("iters", 0)
+
+        yield _make_sse_frame("done", done_data)
+    finally:
+        try:
+            await _run(cx.close)
+        finally:
+            pool.shutdown(wait=False)
+
+
 class ChatRequest(BaseModel):
     messages: list[dict]
     session_id: str | None = None
@@ -76,7 +199,7 @@ def _db():
 
 
 @app.post("/chat")
-async def chat(req: ChatRequest) -> dict:
+async def chat(req: ChatRequest, request: Request):
     """Run a chat turn from the last user message.
 
     v0.10: `session_id` is independent of `turn_id`. A fresh turn_id is
@@ -85,6 +208,14 @@ async def chat(req: ChatRequest) -> dict:
     follows §7 of the design: None or whitespace-only -> mint a new ULID;
     any non-empty string is accepted silently (the server is stateless and
     never raises SessionNotFound).
+
+    v0.13: when the client sends `Accept: text/event-stream`, the handler
+    returns a StreamingResponse with SSE-framed events. Anything else --
+    including a missing Accept header, `application/json`, `*/*`, or a
+    weighted `text/event-stream;q=0.9` -- silently degrades to the v0.10
+    JSON path so legacy callers keep byte-identical responses (§2).
+    Pre-stream validation (no user message) still returns HTTP 400 + JSON
+    even when SSE was requested -- the SSE channel is not opened (§5).
     """
     user_msgs = [m for m in req.messages if m.get("role") == "user"]
     if not user_msgs:
@@ -95,6 +226,13 @@ async def chat(req: ChatRequest) -> dict:
         session_id = ulid()
     else:
         session_id = raw_sess
+
+    if _wants_sse(request.headers.get("accept")):
+        return StreamingResponse(
+            _sse_event_stream(user_msgs[-1]["content"], turn_id, session_id, request),
+            media_type="text/event-stream; charset=utf-8",
+            headers=_SSE_HEADERS,
+        )
 
     def work():
         with _db() as cx:
