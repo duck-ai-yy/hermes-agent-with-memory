@@ -409,6 +409,133 @@ def http_client(tmp_path, monkeypatch, fake_llm):
     return TestClient(fastapi_app)
 
 
+# -- v0.13 / SSE streaming fixtures -----------------------------------------
+
+
+@pytest.fixture
+def sse_client(tmp_path, monkeypatch, fake_llm):
+    """Spin up a TestClient with SSE-aware POST helper.
+
+    Identical setup to `http_client` (DB / events.jsonl rerouted into tmp_path,
+    FakeLLM injected) plus a `.post_sse(body, sid=None)` method that forces
+    `Accept: text/event-stream` and parses the response back to (frames, raw).
+
+    Returns the TestClient itself with two extra attributes attached:
+      - `client.post_sse(body, sid=None) -> (list[dict], bytes)` parses each
+        SSE frame to `{"event": ..., "data": ...}` (data still a string).
+      - `client.parse_data(frame)` -> dict (json.loads the data string).
+
+    raw bytes are preserved exactly as received so tests can check CRLF
+    rejection, UTF-8 encoding, frame separator literals, etc. (lead must-fix:
+    many SSE parsers tolerate CRLF; raw bytes are the only ground truth).
+    """
+    from fastapi.testclient import TestClient
+    from mneme import paths
+    from mneme.server import app as fastapi_app
+
+    db_path = tmp_path / "db.sqlite"
+    events_path = tmp_path / "events.jsonl"
+    monkeypatch.setattr(paths, "DB_PATH", db_path)
+    monkeypatch.setattr(paths, "EVENTS_PATH", events_path)
+
+    cx = store.connect(db_path)
+    store.init_db(cx)
+    cx.close()
+
+    client = TestClient(fastapi_app)
+
+    def _parse_frames(raw: bytes) -> list[dict]:
+        """Parse raw SSE bytes into a list of `{event, data}` dicts.
+
+        Strictly LF-separated (`\\n\\n` between frames; `\\n` between lines
+        inside a frame). The parser is intentionally rigid -- it will trip if
+        a frame uses CRLF, has multiple blank lines, or violates the
+        `event:` / `data:` literal prefixes. Test must verify raw bytes too.
+        """
+        # Split on the canonical "\n\n" separator. Don't try to be helpful.
+        text = raw.decode("utf-8")
+        # Drop trailing separator if present so we don't yield an empty frame.
+        if text.endswith("\n\n"):
+            text = text[:-2]
+        frames: list[dict] = []
+        for block in text.split("\n\n"):
+            if not block:
+                continue
+            event_type: str | None = None
+            data_parts: list[str] = []
+            for line in block.split("\n"):
+                if line.startswith("event: "):
+                    event_type = line[len("event: "):]
+                elif line.startswith("data: "):
+                    data_parts.append(line[len("data: "):])
+                else:
+                    # Unexpected line; surface via empty event marker.
+                    pass
+            frames.append({"event": event_type, "data": "\n".join(data_parts)})
+        return frames
+
+    def post_sse(body: dict, sid: str | None = None) -> tuple[list[dict], bytes]:
+        payload = dict(body)
+        if sid is not None:
+            payload["session_id"] = sid
+        with client.stream(
+            "POST", "/chat",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            raw = b"".join(resp.iter_bytes())
+            # Attach last response so tests can introspect headers / status.
+            post_sse.last_response = resp  # type: ignore[attr-defined]
+            post_sse.last_status = resp.status_code  # type: ignore[attr-defined]
+            post_sse.last_headers = dict(resp.headers)  # type: ignore[attr-defined]
+        return _parse_frames(raw), raw
+
+    def parse_data(frame: dict) -> dict:
+        return json.loads(frame["data"])
+
+    client.post_sse = post_sse  # type: ignore[attr-defined]
+    client.parse_data = parse_data  # type: ignore[attr-defined]
+    client.parse_frames = _parse_frames  # type: ignore[attr-defined]
+    return client
+
+
+@pytest.fixture
+def disconnect_mocker(monkeypatch):
+    """Make `starlette.requests.Request.is_disconnected` controllable.
+
+    Usage:
+        disconnect_mocker.disconnect_after(n_frames)   # False N times then True
+        disconnect_mocker.disconnect_immediately()     # True on first check
+        disconnect_mocker.never_disconnect()           # always False (default)
+
+    The mock replaces the method body so any Request instance picks it up
+    -- this means the disconnect signal is global across the test, which is
+    fine because tests are isolated and each fixture-scoped TestClient
+    talks to exactly one handler invocation in a deterministic order.
+    """
+    state = {"n_false": 0, "default": False, "calls": 0}
+
+    async def fake_is_disconnected(self):  # noqa: ARG001
+        state["calls"] += 1
+        if state["n_false"] > 0:
+            state["n_false"] -= 1
+            return False
+        return state["default"]
+
+    import starlette.requests
+    monkeypatch.setattr(
+        starlette.requests.Request, "is_disconnected", fake_is_disconnected
+    )
+
+    spy = SimpleNamespace(
+        disconnect_after=lambda n: state.update(n_false=n, default=True),
+        disconnect_immediately=lambda: state.update(n_false=0, default=True),
+        never_disconnect=lambda: state.update(n_false=0, default=False),
+        state=state,
+    )
+    return spy
+
+
 @pytest.fixture
 def repl_runner(tmp_path, monkeypatch, fake_llm):
     """Drive the `mneme chat` REPL via Typer's CliRunner. Redirects
