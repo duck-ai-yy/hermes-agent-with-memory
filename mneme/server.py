@@ -143,6 +143,8 @@ async def _sse_event_stream(
         )
 
         reply = None
+        bytes_streamed = 0
+        disconnected = False
         # Use a sentinel to communicate StopIteration from the worker thread:
         # run_in_executor cannot directly propagate StopIteration.
         _DONE = object()
@@ -154,14 +156,34 @@ async def _sse_event_stream(
                 _pull_next.reply = e.value  # type: ignore[attr-defined]
                 return _DONE
 
+        # Check disconnect once after the `start` frame too. If the client
+        # already hung up, we still drive the generator to completion so
+        # respond_stream's _close_turn writes the close-trace (§5
+        # "bytes_streamed == 0: 不写 http_stream_aborted, 但 close-trace 仍写").
+        if await request.is_disconnected():
+            disconnected = True
+
         try:
             while True:
                 chunk = await _run(_pull_next)
                 if chunk is _DONE:
                     reply = _pull_next.reply  # type: ignore[attr-defined]
                     break
+                if disconnected:
+                    # Drain the generator silently. respond_stream is the
+                    # one that owns the close-trace; we must not abort it
+                    # mid-flight or the trace stays open. We swallow the
+                    # chunk and loop until StopIteration.
+                    continue
                 # Step 2: one delta frame per text chunk.
-                yield _make_sse_frame("delta", {"text": chunk})
+                frame = _make_sse_frame("delta", {"text": chunk})
+                bytes_streamed += len(frame)
+                yield frame
+                # §5: per-frame disconnect probe. Setting the flag (rather
+                # than `break`) keeps respond_stream draining so its
+                # close-trace is still written for telemetry consistency.
+                if await request.is_disconnected():
+                    disconnected = True
         except Exception as exc:  # noqa: BLE001  -- last-chance, must yield
             # §5: any mid-stream exception (BudgetExceeded raised after
             # `start`, or any other) -> single `error` frame, close the
@@ -171,7 +193,34 @@ async def _sse_event_stream(
             # type(exc).__name__ -- "BudgetExceeded" naturally falls out
             # of that, and its str(exc) already contains the substring
             # "daily token budget exhausted" pinned by §5.
+            #
+            # If the client already disconnected, we still need to yield
+            # the frame for FastAPI to terminate cleanly; the bytes will
+            # be dropped by the transport. No http_stream_aborted event
+            # is written for the error path (the close-trace itself was
+            # not written, so there is nothing to "abort" semantically).
             yield _make_sse_frame("error", _error_frame_data(exc, session_id))
+            return
+
+        # respond_stream completed (StopIteration). _close_turn ran and
+        # the close-trace is on disk.
+
+        # §5: write http_stream_aborted iff the client disconnected mid-
+        # stream AND at least one delta frame was sent. close-trace was
+        # already written by respond_stream regardless of disconnect.
+        if disconnected:
+            if bytes_streamed > 0 and reply is not None:
+                ep = await _run(store.events_path, cx)
+                if ep is not None:
+                    def _log_aborted():
+                        events.append(
+                            ep, kind="http_stream_aborted",
+                            trace_id=reply.trace_id,
+                            session_id=session_id,
+                            bytes_streamed=bytes_streamed,
+                        )
+                    await _run(_log_aborted)
+            # Disconnected path never yields `done`.
             return
 
         # Step 3: done frame. The close-trace event was written by
