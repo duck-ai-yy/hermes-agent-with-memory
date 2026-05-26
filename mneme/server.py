@@ -63,6 +63,26 @@ def _make_sse_frame(event_type: str, data: dict) -> bytes:
     return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
 
 
+def _error_frame_data(exc: BaseException, session_id: str) -> dict:
+    """Build the `error` frame data dict.
+
+    Field order pinned to the §3 literal {error_type, message, session_id}.
+    `message` is `str(exc)`; if it exceeds 500 characters it is sliced to
+    the first 500 and an ellipsis-plus-`(truncated)` suffix is appended.
+    The suffix character is the U+2026 HORIZONTAL ELLIPSIS, NOT three
+    ASCII dots, per the orchestrator pin on F4. Total `message` length
+    ceiling: 500 + len("…(truncated)") = 513 characters.
+    """
+    msg = str(exc)
+    if len(msg) > 500:
+        msg = msg[:500] + "…(truncated)"
+    return {
+        "error_type": type(exc).__name__,
+        "message": msg,
+        "session_id": session_id,
+    }
+
+
 # SSE response headers — set together as a single dict per lead phase-1 hint:
 # `Content-Type` is set implicitly via StreamingResponse(media_type=...), but
 # `Cache-Control` and `X-Accel-Buffering` must travel together. The v0.15
@@ -134,13 +154,25 @@ async def _sse_event_stream(
                 _pull_next.reply = e.value  # type: ignore[attr-defined]
                 return _DONE
 
-        while True:
-            chunk = await _run(_pull_next)
-            if chunk is _DONE:
-                reply = _pull_next.reply  # type: ignore[attr-defined]
-                break
-            # Step 2: one delta frame per text chunk.
-            yield _make_sse_frame("delta", {"text": chunk})
+        try:
+            while True:
+                chunk = await _run(_pull_next)
+                if chunk is _DONE:
+                    reply = _pull_next.reply  # type: ignore[attr-defined]
+                    break
+                # Step 2: one delta frame per text chunk.
+                yield _make_sse_frame("delta", {"text": chunk})
+        except Exception as exc:  # noqa: BLE001  -- last-chance, must yield
+            # §5: any mid-stream exception (BudgetExceeded raised after
+            # `start`, or any other) -> single `error` frame, close the
+            # stream, do NOT yield `done`, do NOT write a close-trace
+            # (there is no reply_text). HTTP status stays 200 because
+            # headers are already on the wire. error_type is always
+            # type(exc).__name__ -- "BudgetExceeded" naturally falls out
+            # of that, and its str(exc) already contains the substring
+            # "daily token budget exhausted" pinned by §5.
+            yield _make_sse_frame("error", _error_frame_data(exc, session_id))
+            return
 
         # Step 3: done frame. The close-trace event was written by
         # _close_turn inside respond_stream right before StopIteration
