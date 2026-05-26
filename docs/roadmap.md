@@ -14,17 +14,17 @@
 | v0.5 | 每日云 token 预算硬墙 | 39 |
 | v0.6 | `mneme search` CLI（首次多 agent 协作） | 60 |
 | v0.7 | 每轮 $ 成本显示 | 93 |
+| v0.8 | Agent loop (M1)：respond() user→LLM→tool→LLM→response | — |
+| v0.9 | Tool registry (M2)：@tool 装饰器 + file_read / web_fetch / python_exec | — |
+| v0.10 | Multi-turn session context：session_id 贯通 agent / server / events | 325 |
+| v0.13 | HTTP `/chat` SSE 流式（Accept-协商，JSON path 字节不变） | — |
 
 ## 接下来 ⏳（M1-M4 织入）
 
 | 版 | 来源 | 主题 | 大小 | 依赖 |
 |---|---|---|---|---|
-| **v0.8** | **M1** | Agent loop：`respond()` 升级为 user→LLM→tool→LLM→response 循环；第一个 tool = `shell`（带 confirm）；保持现有 memory recall / citation / budget 全部还能跑 | M | — |
-| **v0.9** | **M2** | Tool registry：`@tool` 装饰器 → schema 自动生成 → LLM function calling；加 `file_read` / `web_fetch` / `python_exec` 三个工具；可插拔 | M | v0.8 |
-| **v0.10** | 旧 v0.8 | Multi-turn session context：session_id 贯通 agent / server / events；与 M1 loop 状态自然融合 | S-M | v0.8 |
 | **v0.11** | **M3** | 上下文窗口管理：token 计数 → 压缩 → 摘要；持久记忆已 done，只补 token-budget-aware prompt 组装 | M | v0.10 |
 | **v0.12** | **M4** | Skill system：`~/.mneme/skills/<name>/SKILL.md` + 触发条件 + 可选 `script.py`；agent 完成复杂任务后可自主生成 skill | M | v0.9, v0.11 |
-| **v0.13** | 旧 v0.9 | HTTP `/chat` 流式 + session_id | S-M | v0.10 |
 | **v0.14** | 旧 v0.10 | `mneme dream`：nightly cron 合成今日 concept node | M | v0.11 |
 | **v0.15** | 旧 v0.11 | 飞书 webhook adapter | L | v0.9, v0.10, v0.13 |
 
