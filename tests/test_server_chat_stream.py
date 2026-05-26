@@ -1035,6 +1035,48 @@ def test_R_12_error_frame_data_has_exactly_three_keys(sse_client, fake_llm):
 
 
 # ============================================================================
+# Source-grep ratchets -- belt-and-braces invariants the runtime layer alone
+# cannot catch (v0.10 lesson: grep + runtime double pin)
+# ============================================================================
+
+
+def test_R_grep_sse_path_passes_allowed_tools_empty_explicit():
+    """Belt-and-braces grep ratchet: the SSE _sse_event_stream MUST pass
+    `allowed_tools=[]` to respond_stream, even though `confirm_cb=None`
+    alone gates tools off. Self-flag finding: M-16 mutation (drop
+    `allowed_tools=[]`) does not affect observable behavior because the
+    confirm_cb=None guard fires first -- but per v0.9 lesson, **belt-
+    and-braces invariants need source-level pins too**.
+    """
+    src = (Path(__file__).parent.parent / "mneme/server.py").read_text(
+        encoding="utf-8"
+    )
+    # The SSE branch literal:
+    assert "confirm_cb=None, allowed_tools=[]," in src, (
+        "SSE branch lost the explicit allowed_tools=[] belt-and-braces guard"
+    )
+    # And the JSON branch keeps the same guarantee.
+    # (v0.10 R-15 covers JSON; this asserts the literal stays.)
+    assert "allowed_tools=[]" in src
+
+
+def test_R_grep_pool_max_workers_one_for_sqlite_affinity():
+    """Belt-and-braces grep ratchet for SQLite thread affinity. The dev
+    finding: `ThreadPoolExecutor(max_workers=1)` keeps every sync hop on
+    the same OS thread, satisfying SQLite's default
+    `check_same_thread=True`. Mutation M-21 (`max_workers=4`) doesn't
+    fire observably in the small-load test environment, but the
+    invariant is real and load-dependent. Pin it at the source level so
+    a refactor that bumps max_workers gets caught by CI."""
+    src = (Path(__file__).parent.parent / "mneme/server.py").read_text(
+        encoding="utf-8"
+    )
+    assert "ThreadPoolExecutor(max_workers=1)" in src, (
+        "SQLite thread affinity guard ThreadPoolExecutor(max_workers=1) lost"
+    )
+
+
+# ============================================================================
 # G-section -- KPI: v0.10 baseline tests untouched (zero modification)
 # ============================================================================
 #
