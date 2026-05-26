@@ -2,11 +2,16 @@
 
 Synchronous SQLite work is wrapped in `asyncio.to_thread` so it does not block
 the event loop (PRINCIPLES.md principle 3: no aiosqlite dependency).
+
+v0.13: POST /chat gains an SSE streaming variant. Negotiation is Accept-based
+(`text/event-stream` -> SSE; anything else -> the v0.10 JSON path byte-for-byte).
+Helpers live in this module per PRINCIPLE 1 (no new files for ~50 LOC).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from contextlib import contextmanager
 
@@ -20,7 +25,40 @@ from .memory import forget as forget_mod
 from .memory import store
 from .trace import events
 
-app = FastAPI(title="Mneme", version="0.10.0")
+app = FastAPI(title="Mneme", version="0.13.0")
+
+
+# -- SSE helpers (v0.13) ---------------------------------------------------
+#
+# Pure functions, no side effects, no I/O. The streaming generator (Unit C)
+# is added in step 2.
+
+
+def _wants_sse(accept_header: str | None) -> bool:
+    """Accept-header content negotiation for the SSE branch.
+
+    True iff the first comma-separated token, stripped and lower-cased, is
+    exactly `text/event-stream`. Every other value (None, empty, `*/*`,
+    `application/json`, `text/event-stream;q=0.9`, garbage) silently degrades
+    to the v0.10 JSON path. The literal rule is taken verbatim from the
+    v0.13 design §2 — `accept_raw.split(",")[0].strip().lower()` — so the
+    JSON path stays byte-identical for legacy callers.
+    """
+    if accept_header is None:
+        return False
+    return accept_header.split(",")[0].strip().lower() == "text/event-stream"
+
+
+def _make_sse_frame(event_type: str, data: dict) -> bytes:
+    """Format one SSE frame as `event: <type>\\ndata: <json>\\n\\n` bytes.
+
+    Single-line, compact JSON (no spaces, no newlines), UTF-8 encoded, LF
+    line endings (no CRLF). `ensure_ascii=False` keeps non-ASCII characters
+    raw (e.g. CJK in user text) instead of `\\uXXXX`-escaping them — the
+    payload is already UTF-8.
+    """
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event_type}\ndata: {payload}\n\n".encode("utf-8")
 
 
 class ChatRequest(BaseModel):
