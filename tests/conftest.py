@@ -450,3 +450,99 @@ def repl_runner(tmp_path, monkeypatch, fake_llm):
     # Expose the AssistantMessage symbol for tests that want to script.
     _run.AssistantMessage = AssistantMessage
     return _run
+
+
+# -- v0.11 / token-budget fixtures ------------------------------------------
+
+
+@pytest.fixture
+def clear_warn_cache():
+    """Reset the budget module's warn-once caches around one test.
+
+    Three module-level caches drive "warn once per offending value" behavior:
+      * `budget._warned`          — unknown (provider, model) pairs.
+      * `budget._warned_ratio`    — invalid MNEME_CONTEXT_BUDGET_RATIO values.
+      * `budget._warned_missing_section` — pricing.yaml missing context_windows.
+
+    Tests that exercise the warning path must start from a clean slate, AND
+    must restore the originals so a test that runs BEFORE them does not get
+    its warning-state mutated. We restore by .clear() + .update() / by-name
+    assignment so any cached reference still observes the same object.
+    """
+    from mneme.llm import budget as _budget
+    snapshot_warned = set(_budget._warned)
+    snapshot_warned_ratio = set(_budget._warned_ratio)
+    snapshot_missing = _budget._warned_missing_section
+    _budget._warned.clear()
+    _budget._warned_ratio.clear()
+    _budget._warned_missing_section = False
+    try:
+        yield
+    finally:
+        _budget._warned.clear()
+        _budget._warned.update(snapshot_warned)
+        _budget._warned_ratio.clear()
+        _budget._warned_ratio.update(snapshot_warned_ratio)
+        _budget._warned_missing_section = snapshot_missing
+
+
+@pytest.fixture
+def tmp_pricing_yaml(tmp_path, monkeypatch):
+    """Point BOTH the pricing loader's path AND its cache at a tmp file.
+
+    Lead must-fix #5: dev's `budget.context_window_for` calls
+    `pricing._load_table()` (the @functools.cache'd reader) so fixture-scope
+    coverage must:
+      * redirect `pricing._TABLE_PATH` so a re-read picks up tmp content;
+      * clear `pricing._load_table`'s cache so the redirected path is hit
+        (functools.cache memoizes by `()` — it never rechecks the file).
+    Returns a `write(yaml_text: str)` callable; each call rewrites the tmp
+    file and re-clears the cache.
+    """
+    from mneme.llm import pricing as _pricing
+    tmp_yaml = tmp_path / "pricing.yaml"
+    monkeypatch.setattr(_pricing, "_TABLE_PATH", tmp_yaml)
+
+    def _write(yaml_text: str) -> None:
+        tmp_yaml.write_text(yaml_text, encoding="utf-8")
+        _pricing._load_table.cache_clear()
+
+    # Pre-clear so a previous test's parse of the real pricing.yaml does not
+    # leak into this test.
+    _pricing._load_table.cache_clear()
+    try:
+        yield _write
+    finally:
+        # Reset the cache so subsequent tests get the real pricing.yaml again
+        # when they call _load_table.
+        _pricing._load_table.cache_clear()
+
+
+@pytest.fixture
+def assemble_spy(monkeypatch):
+    """Wrap `mneme.llm.budget.assemble_prompt` with a call-recording spy.
+
+    Returns a SimpleNamespace exposing `calls` (list of dicts with kwargs +
+    return triple). The real implementation still runs, so downstream code
+    is unaffected; only used by tests that need to assert HOW the agent
+    called the assembler (e.g. C10 "user_text passed verbatim").
+    """
+    from mneme.llm import budget as _budget
+    real = _budget.assemble_prompt
+    state = SimpleNamespace(calls=[])
+
+    def spy(prefix, slices, user_text, budget_in):
+        result = real(prefix, slices, user_text, budget_in)
+        state.calls.append({
+            "prefix": prefix,
+            "slices": list(slices),
+            "user_text": user_text,
+            "budget": budget_in,
+            "result": result,
+        })
+        return result
+
+    monkeypatch.setattr(_budget, "assemble_prompt", spy)
+    # Agent imports `from .llm import budget` then calls
+    # `budget.assemble_prompt(...)` — module attr patch above covers that path.
+    return state
