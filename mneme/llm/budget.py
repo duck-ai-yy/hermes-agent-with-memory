@@ -22,6 +22,7 @@ prices and window sizes together), so co-locating cuts the maintenance tax.
 
 from __future__ import annotations
 
+import os
 import sys
 
 from . import pricing
@@ -110,3 +111,66 @@ def context_window_for(provider: str, model: str) -> int:
         )
         _warned.add(key)
     return _FALLBACK_WINDOW
+
+
+# -- Unit B (lower half): budget_for_retrieval ----------------------------
+
+# Per-bad-value warn-once cache for MNEME_CONTEXT_BUDGET_RATIO, same shape
+# as _warned above (set[str], one entry per offending value).
+_warned_ratio: set[str] = set()
+
+
+def _reserve_ratio_inv() -> int:
+    """Resolve the completion-reserve ratio's integer inverse at call time.
+
+    Returns the "N" in `window // N` (so the default 0.25 means N == 4).
+    Reads `MNEME_CONTEXT_BUDGET_RATIO` from the environment on each call —
+    mirrors `agent._max_iters()`'s style so monkeypatching env vars in
+    tests "just works" without process restart.
+
+    Invalid values (non-numeric, <= 0.0, >= 1.0) silently fall back to the
+    default with a one-shot stderr warning naming the bad value.
+    """
+    raw = os.environ.get("MNEME_CONTEXT_BUDGET_RATIO")
+    if raw is None:
+        return _COMPLETION_RESERVE_RATIO_DEFAULT_INV
+    try:
+        ratio = float(raw)
+    except ValueError:
+        if raw not in _warned_ratio:
+            print(
+                f"mneme: invalid MNEME_CONTEXT_BUDGET_RATIO={raw}, "
+                "falling back to 0.25",
+                file=sys.stderr,
+            )
+            _warned_ratio.add(raw)
+        return _COMPLETION_RESERVE_RATIO_DEFAULT_INV
+    if ratio <= 0.0 or ratio >= 1.0:
+        if raw not in _warned_ratio:
+            print(
+                f"mneme: invalid MNEME_CONTEXT_BUDGET_RATIO={raw}, "
+                "falling back to 0.25",
+                file=sys.stderr,
+            )
+            _warned_ratio.add(raw)
+        return _COMPLETION_RESERVE_RATIO_DEFAULT_INV
+    # Convert ratio to integer divisor: `window // (1/ratio)` == `window * ratio`
+    # in spirit, kept as integer division to match the design's `// 4` pin.
+    return max(1, int(round(1.0 / ratio)))
+
+
+def budget_for_retrieval(provider: str, model: str) -> int:
+    """Tokens available for prefix + suffix after reserving completion + tools.
+
+    `max(_COMPLETION_RESERVE_FLOOR, window // N)` keeps very small windows
+    (like ollama's 8192 conservative default) from collapsing the reserve
+    to a useless few tokens; the 1024 floor matches the tools-schema
+    reserve so both halves of the "fixed overhead" have the same minimum.
+    Returns `max(0, ...)` so a pathological config (window <= reserves)
+    surfaces as budget=0 — which `assemble_prompt` then turns into the
+    `PromptTooBig` raise for any non-empty prompt (design §4).
+    """
+    window = context_window_for(provider, model)
+    inv = _reserve_ratio_inv()
+    completion_reserve = max(_COMPLETION_RESERVE_FLOOR, window // inv)
+    return max(0, window - completion_reserve - _TOOLS_SCHEMA_RESERVE)
