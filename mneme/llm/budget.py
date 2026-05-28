@@ -85,10 +85,6 @@ def context_window_for(provider: str, model: str) -> int:
     """
     global _warned_missing_section
 
-    if provider == "ollama":
-        # Conservative default; intentional and silent (design §3).
-        return _FALLBACK_WINDOW
-
     table = pricing._load_table()
     windows = table.get("context_windows")
     if not isinstance(windows, dict):
@@ -99,6 +95,16 @@ def context_window_for(provider: str, model: str) -> int:
                 file=sys.stderr,
             )
             _warned_missing_section = True
+        return _FALLBACK_WINDOW
+
+    if provider == "ollama":
+        # Always the wildcard; modelfile num_ctx is not introspectable, so
+        # we stay conservative — and stay silent (design §3, no warn).
+        ollama_windows = windows.get("ollama")
+        if isinstance(ollama_windows, dict):
+            value = ollama_windows.get("*")
+            if isinstance(value, int):
+                return value
         return _FALLBACK_WINDOW
 
     provider_windows = windows.get(provider)

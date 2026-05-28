@@ -23,3 +23,20 @@ deepseek:
   deepseek-chat:
     input: 0.27
     output: 1.10
+
+# Context window sizes (in tokens). Read by mneme/llm/budget.py to derive
+# the per-call slice budget; pricing.py ignores this section. Co-located
+# with the price table because vendors ship price + window updates together.
+# Ollama uses a single "*" wildcard — modelfile num_ctx is not introspectable
+# from here, so we stay conservative for every local model.
+context_windows:
+  openai:
+    gpt-4o: 128000
+    gpt-4o-mini: 128000
+  anthropic:
+    claude-sonnet-4-6: 200000
+    claude-haiku-4-5: 200000
+  deepseek:
+    deepseek-chat: 64000
+  ollama:
+    "*": 8192
