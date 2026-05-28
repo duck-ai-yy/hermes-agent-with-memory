@@ -102,7 +102,6 @@ N6  pyproject.toml does NOT carry a tiktoken / transformers dep.
 from __future__ import annotations
 
 import inspect
-import os
 from pathlib import Path
 
 import pytest
