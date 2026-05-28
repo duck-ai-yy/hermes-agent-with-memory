@@ -24,6 +24,7 @@ from typing import Callable, Iterator
 
 from . import soul
 from .ids import ulid
+from .llm import budget
 from .llm import client as _llm
 from .llm import pricing
 from .llm.client import AssistantMessage, ToolCall, Usage
@@ -127,14 +128,31 @@ def _open_turn(
     client = _llm.get_client()
     ep = store.events_path(cx)
 
+    # v0.11 / M3: enforce the per-model token budget. May drop low-score
+    # tail slices to make the prompt fit; raises PromptTooBig if even an
+    # empty-suffix prompt overflows. The raise path intentionally leaves
+    # NO open trace (it's an input problem, not an LLM/IO failure) — the
+    # PromptTooBig instance carries estimated / budget / dropped_count so
+    # the caller still has full forensic info (design §4 / lead D9). The
+    # user slice is already persisted above, satisfying F11c.
+    prefix, suffix, meta = budget.assemble_prompt(
+        prefix, slices, user_text,
+        budget.budget_for_retrieval(client.config.provider, client.config.chat_model),
+    )
+    # The "slices the model actually saw" — used downstream for citation
+    # classification (a citation pointing at a dropped slice is fabricated).
+    kept_slices = [s for s in slices if s.id in set(meta.kept_slice_ids)]
+
     # Trace BEFORE the call so a crash mid-call still leaves a record.
     if ep is not None:
         events.append(ep, kind="trace", id=trace_id, query=user_text,
                       session_id=session_id,
-                      used_slices=[s.id for s in slices],
+                      used_slices=meta.kept_slice_ids,
                       prompt_hash=soul.prompt_hash(prefix + "\n" + suffix),
-                      model=client.config.chat_model, provider=client.config.provider)
-    return slices, prefix, suffix, trace_id, client, ep
+                      model=client.config.chat_model, provider=client.config.provider,
+                      prompt_assembled_tokens=meta.estimated_tokens,
+                      prompt_dropped_slice_ids=meta.dropped_slice_ids)
+    return kept_slices, prefix, suffix, trace_id, client, ep
 
 
 def _close_turn(
