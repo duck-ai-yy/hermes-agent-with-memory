@@ -24,8 +24,13 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from . import pricing
+
+if TYPE_CHECKING:  # pragma: no cover — types only
+    from ..memory.retrieve import Slice
 
 # -- Module constants (pinned by design §3 / §4 / §8) ---------------------
 
@@ -174,3 +179,100 @@ def budget_for_retrieval(provider: str, model: str) -> int:
     inv = _reserve_ratio_inv()
     completion_reserve = max(_COMPLETION_RESERVE_FLOOR, window // inv)
     return max(0, window - completion_reserve - _TOOLS_SCHEMA_RESERVE)
+
+
+# -- Unit C: assemble_prompt + AssemblyMeta + PromptTooBig ----------------
+
+@dataclass(frozen=True)
+class AssemblyMeta:
+    """Forensic record of how `assemble_prompt` shaped the final prompt.
+
+    `estimated_tokens` is the heuristic (`estimate_tokens`) total over the
+    final prefix + suffix — NOT the provider's authoritative token count,
+    which only arrives in the close-trace via usage. `dropped_slice_ids`
+    preserves drop order (tail-first) so a reviewer can replay the
+    decision; `kept_slice_ids` preserves the order the surviving slices
+    appear in the suffix (== the input order with dropped IDs removed).
+    """
+
+    estimated_tokens: int
+    kept_slice_ids: list[str]
+    dropped_slice_ids: list[str]
+    original_slice_count: int
+
+
+class PromptTooBig(Exception):
+    """Raised when even an empty-suffix prompt overflows the budget.
+
+    Carries the forensic triple (`estimated`, `budget`, `dropped_count`)
+    as instance attributes so a CLI / HTTP caller can recover the same
+    numbers without going through events.jsonl — `except PromptTooBig as
+    exc: exc.estimated` works directly (design §4 / lead D9).
+    """
+
+    def __init__(self, estimated: int, budget: int, dropped_count: int) -> None:
+        self.estimated = estimated
+        self.budget = budget
+        self.dropped_count = dropped_count
+        super().__init__(
+            f"prompt exceeds budget after dropping all {dropped_count} "
+            f"retrieved slices: estimated={estimated} budget={budget}"
+        )
+
+
+def assemble_prompt(
+    prefix: str,
+    slices: list["Slice"],
+    user_text: str,
+    budget: int,
+) -> tuple[str, str, AssemblyMeta]:
+    """Return `(prefix, suffix, meta)` after enforcing the token budget.
+
+    Strategy: rebuild `suffix` via `agent.build_prompt(user_text, kept, ...)`
+    so the suffix format stays single-sourced (recall.yaml's `slice_line`
+    / `empty` templates own it — PRINCIPLE 1, no double formatting).
+    Drop slices from the tail (`retrieve.recall` returns them score DESC,
+    so the tail is the lowest-relevance entry) until `estimated_tokens
+    (prefix) + estimated_tokens(suffix) <= budget`. If we run out of
+    slices and the prompt still doesn't fit, raise `PromptTooBig`.
+
+    `prefix` and `user_text` are never modified or truncated — the
+    stable prefix preserves the LLM provider's prompt cache hit
+    (PRINCIPLE 2) and the user's query is ground truth (PRINCIPLE 5,
+    silent truncation would let the model answer the wrong question).
+    """
+    # Lazy-import to avoid the agent <-> llm import cycle: agent.py
+    # already pulls in llm.client / llm.pricing at module import, so
+    # llm.budget cannot pull in agent at module load.
+    from .. import soul
+    from ..agent import build_prompt
+
+    blueprint = soul.load_blueprint()
+    original_count = len(slices)
+    kept = list(slices)
+
+    # Initial build with all slices.
+    _, suffix = build_prompt(user_text, kept, blueprint)
+    estimated = estimate_tokens(prefix) + estimate_tokens(suffix)
+
+    dropped_ids: list[str] = []
+    # Drop from the tail one at a time, rebuilding suffix each round.
+    while estimated > budget and kept:
+        dropped_ids.append(kept[-1].id)
+        kept = kept[:-1]
+        _, suffix = build_prompt(user_text, kept, blueprint)
+        estimated = estimate_tokens(prefix) + estimate_tokens(suffix)
+
+    if estimated > budget:
+        # Even with no retrieved slices the prefix + user_text overflows;
+        # there is nothing more to drop without lying to the model.
+        raise PromptTooBig(
+            estimated=estimated, budget=budget, dropped_count=len(dropped_ids),
+        )
+
+    return prefix, suffix, AssemblyMeta(
+        estimated_tokens=estimated,
+        kept_slice_ids=[s.id for s in kept],
+        dropped_slice_ids=dropped_ids,
+        original_slice_count=original_count,
+    )
