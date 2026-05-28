@@ -22,6 +22,10 @@ prices and window sizes together), so co-locating cuts the maintenance tax.
 
 from __future__ import annotations
 
+import sys
+
+from . import pricing
+
 # -- Module constants (pinned by design §3 / §4 / §8) ---------------------
 
 _FALLBACK_WINDOW = 8192
@@ -48,3 +52,61 @@ def estimate_tokens(text: str) -> int:
     signature if a real miss ever shows up.
     """
     return len(text) // 4 + 1
+
+
+# -- Unit B (upper half): context_window_for ------------------------------
+
+# (provider, model) tuples we have already warned about — module-level so
+# the warning fires once per process per unknown pair (PRINCIPLE 1: same
+# shape as pricing.py's one-shot stderr).
+_warned: set[tuple[str, str]] = set()
+# A sentinel so the "missing context_windows section" warning also fires
+# at most once, regardless of how many lookups hit it.
+_warned_missing_section = False
+
+
+def context_window_for(provider: str, model: str) -> int:
+    """Look up the context window (in tokens) for `(provider, model)`.
+
+    - Ollama is always returned as the fallback constant: a user's modelfile
+      `num_ctx` is not introspectable from here, so we stay conservative
+      (design §3) — silent, no warning.
+    - A hit in `pricing.yaml`'s `context_windows:` section returns that int.
+    - Anything else (unknown provider, unknown model, or a malformed
+      `context_windows:` section) returns `_FALLBACK_WINDOW` and emits a
+      one-shot stderr warning naming the actual layer that failed (the
+      `pricing.py:_load_table` lesson, applied to this loader too).
+    """
+    global _warned_missing_section
+
+    if provider == "ollama":
+        # Conservative default; intentional and silent (design §3).
+        return _FALLBACK_WINDOW
+
+    table = pricing._load_table()
+    windows = table.get("context_windows")
+    if not isinstance(windows, dict):
+        if not _warned_missing_section:
+            print(
+                "mneme: pricing.yaml missing context_windows section, "
+                "falling back to 8192 tokens",
+                file=sys.stderr,
+            )
+            _warned_missing_section = True
+        return _FALLBACK_WINDOW
+
+    provider_windows = windows.get(provider)
+    if isinstance(provider_windows, dict):
+        value = provider_windows.get(model)
+        if isinstance(value, int):
+            return value
+
+    key = (provider, model)
+    if key not in _warned:
+        print(
+            f"mneme: unknown context window for {provider}/{model}, "
+            "falling back to 8192 tokens",
+            file=sys.stderr,
+        )
+        _warned.add(key)
+    return _FALLBACK_WINDOW
