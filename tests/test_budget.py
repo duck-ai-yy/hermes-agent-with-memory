@@ -695,3 +695,15 @@ def test_R_A_2_budget_source_no_tokenizer_import():
     src = inspect.getsource(budget)
     assert "tiktoken" not in src
     assert "transformers" not in src
+
+
+def test_R_13b_PromptTooBig_not_subclass_of_ValueError_or_RuntimeError():
+    """Lead phase-1 should-fix R-13b: PromptTooBig must not subclass
+    ValueError / RuntimeError so callers using `except ValueError` or
+    `except RuntimeError` (a common bare-defensive pattern) don't silently
+    swallow it. Pin direct inheritance from Exception only."""
+    from mneme.llm.budget import PromptTooBig
+    assert issubclass(PromptTooBig, Exception)
+    assert not issubclass(PromptTooBig, ValueError)
+    assert not issubclass(PromptTooBig, RuntimeError)
+
